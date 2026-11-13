@@ -16,30 +16,30 @@ Key Architectural Features:
      - Predicts a sharp polyphonic pitch probability distribution (`f0_logits`), learned
        voice-presence gate (`gate_logits`), sub-bin frequency offset, and stereo pan field
        across `n_f0_bins=240` log-spaced pitch bins (65-1100 Hz).
-     - Uses 100% vectorized harmonic-sieve peak extraction, canonical pitch-offset ordering, and
-       single-kernel Nadaraya-Watson normalized convolution sample-and-hold (zero Python frame
-       loops and zero blocking `.item()` GPU syncs) so voice tracks never swap identities or
-       chirp toward random bins during fade-in/out.
-  3. Low-VRAM Checkpointed Sample-Rate (44.1 kHz) Time-Domain Harmonic + Formant Synthesizer:
+     - Uses 100% vectorized harmonic-sieve peak extraction (up to 4 simultaneous voices),
+       canonical pitch-offset ordering, and single-kernel Nadaraya-Watson normalized
+       convolution sample-and-hold (zero Python frame loops and zero blocking `.item()` GPU syncs).
+  3. Learned Cover-Style Prosody & Accent Transfer (`SingerStyleProsodyPredictor` + Learned Blur):
+     - `StereoContentEncoder` learns a differentiable frequency-smoothing bandwidth (`raw_accent_sigma`)
+       balanced between phonetic reconstruction and speaker-invariant VICReg alignment, automatically
+       neutralizing source accent/formant cues so the decoder renders the trained singer's pronunciation.
+     - `SingerStyleProsodyPredictor` learns the trained singer's vibrato, pitch scoops, and dynamic
+       swells along with a per-frame confidence gate (`style_gate`) that automatically applies cover
+       style on sustained notes while preserving tight consonant articulation.
+  4. Low-VRAM Checkpointed Sample-Rate (44.1 kHz) Time-Domain Harmonic + Formant Synthesizer:
      - Integrates instantaneous phase (`cumsum`) strictly on the fundamental voice trajectories
-       `[B, V, L]` (64x smaller than per-harmonic cumsum) and uses gradient checkpointing on the
-       sample-rate sinusoidal oscillator bank so `[B, 2, K, L]` buffers are never retained in
-       VRAM during backpropagation.
-     - Shapes vocal timbre with a smooth 48-band vocal-tract formant filter and bounded
-       small-angle polar phase dispersion (`|theta| <= pi/8`), preventing narrowband comb-filter
-       vocoder artifacts and 180-degree phase flips.
-  4. Prodigy Optimizer (Mishchenko & Defazio, 2023 - https://arxiv.org/abs/2306.06101):
-     Built-in parameter-free D-Adaptation AdamW optimizer (uses `prodigyopt` if installed,
-     otherwise falls back to the built-in self-contained implementation).
-  5. QKVO Rotary Position Embedding (RoPE on Q, K, and V) & Exclusive Self Attention (XSA):
-     Applies rotary positional embeddings to Query, Key, and Value projections with inverse
-     output rotation and orthogonal self-value projection (arXiv:2603.09078) in fp32.
+       `[B, V, L]` and uses gradient checkpointing on the sample-rate sinusoidal oscillator bank
+       so `[B, 2, K, L]` buffers are never retained in VRAM during backpropagation.
+     - Shapes vocal timbre with a smooth 96-band vocal-tract formant filter, bounded
+       small-angle polar phase dispersion, and a short-receptive-field Snake waveform refiner.
+  5. Prodigy Optimizer (Mishchenko & Defazio, 2023 - https://arxiv.org/abs/2306.06101)
+     & QKVO Rotary Position Embedding + Exclusive Self Attention (XSA, arXiv:2603.09078).
 
 Usage:
   Train on a folder of WAV/FLAC files (or a single file):
     python svc_roformer_xsa.py --train --data_dir ./singer_data --ckpt_dir ./checkpoints
 
-  Convert a source WAV/FLAC (solo, double-tracked, or multi-voice harmony) using latest checkpoint:
+  Convert a source WAV/FLAC (solo, double-tracked, or multi-voice harmony):
     python svc_roformer_xsa.py --infer --input ./source_vocal.wav --output ./converted.wav --ckpt_dir ./checkpoints
 """
 
@@ -93,6 +93,7 @@ class SVCConfig:
     f0_max: float = 1100.0
     n_f0_bins: int = 240
     n_harmonics: int = 128
+    max_polyphony: int = 4
 
     dim: int = 384
     content_dim: int = 32
@@ -427,7 +428,7 @@ def split_decay_param_groups(model: nn.Module, weight_decay: float) -> List[Dict
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim < 2 or name.endswith(".bias") or "norm" in name or "emb" in name or "alpha" in name or "phase" in name:
+        if p.ndim < 2 or name.endswith(".bias") or "norm" in name or "emb" in name or "alpha" in name or "phase" in name or "sigma" in name:
             no_decay_params.append(p)
         else:
             decay_params.append(p)
@@ -545,7 +546,7 @@ class StereoAcousticFeatureExtractor(nn.Module):
       - Stereo Log-Mel Spectrogram `[B, 2, T, n_mels]` (Left & Right)
       - Mid/Side Log-Mel Spectrogram `[B, 2, T, n_mels]` (Mid & Side)
       - 2-Channel (L/R) Harmonic-Comb, Window-Normalized Autocorrelation, and Stereo Pan Salience Maps
-      - Sparse 3-Pass Harmonic-Sieve Reference Pitch Distribution `ref_pitch_dist [B, T, n_f0_bins]`
+      - Sparse Multi-Pass Harmonic-Sieve Reference Pitch Distribution `ref_pitch_dist [B, T, n_f0_bins]`
       - Stereo Log Frame RMS Energy `[B, T, 3]` (Left, Right, and Side)
     """
 
@@ -711,7 +712,6 @@ class StereoAcousticFeatureExtractor(nn.Module):
             ).view_as(log_pow)
             whitened_pow = (log_pow - smooth_pow).clamp(-4.0, 6.0)
 
-            # Standard stereo convention: -1.0 = Left, +1.0 = Right
             pan_spec = (power_2ch[:, 1] - power_2ch[:, 0]) / (power_sum + 1e-7)
 
             bin_hz = float(self.cfg.sample_rate) / float(fft_len)
@@ -737,7 +737,7 @@ class StereoAcousticFeatureExtractor(nn.Module):
             comb_salience = torch.tanh(comb_salience / 4.0)
             pan_salience = (pan_salience / pan_weight_sum).clamp(-1.0, 1.0)
 
-            joint_salience = 0.60 * acf_salience + 0.40 * comb_salience
+            joint_salience = 0.50 * acf_salience + 0.50 * comb_salience
 
             if T > 1:
                 sal_t = joint_salience.permute(0, 2, 1).reshape(B * N_bins, 1, T)
@@ -748,10 +748,14 @@ class StereoAcousticFeatureExtractor(nn.Module):
                 smoothed_sal = joint_salience.clone()
 
             raw_acf_peak = acf_at_lag.max(dim=-1).values.clamp(0.0, 1.0)
+            raw_comb_peak = comb_salience.max(dim=-1).values.clamp(0.0, 1.0)
             energy_floor = log_energy_mid.amax(dim=-1, keepdim=True) - 4.4
             energy_gate = torch.sigmoid((log_energy_mid - energy_floor) * 2.5)
-            ref_voicing = ((raw_acf_peak > 0.30) & (log_energy_mid > energy_floor)).float()
-            ref_conf = (raw_acf_peak * energy_gate).clamp(0.0, 1.0)
+            ref_voicing = (
+                ((raw_acf_peak > 0.22) | (raw_comb_peak > 0.35))
+                & (log_energy_mid > energy_floor)
+            ).float()
+            ref_conf = (torch.maximum(raw_acf_peak, 0.85 * raw_comb_peak) * energy_gate).clamp(0.0, 1.0)
 
             sieve_mat = self.sieve_kernel.to(device, dtype=torch.float32)
             residual_sal = F.relu(smoothed_sal + 0.20)
@@ -762,7 +766,8 @@ class StereoAcousticFeatureExtractor(nn.Module):
             ref_multi_activity = torch.zeros(B, T, N_bins, device=device, dtype=torch.float32)
             ref_pitch_unnorm = torch.zeros(B, T, N_bins, device=device, dtype=torch.float32)
 
-            for p_iter in range(3):
+            max_poly = int(getattr(self.cfg, "max_polyphony", 4))
+            for p_iter in range(max_poly):
                 peak_val, peak_bin = residual_sal.max(dim=-1)
                 local_mask = (bin_indices - peak_bin.unsqueeze(-1)).abs() <= 5
                 masked_logits = torch.where(
@@ -781,11 +786,11 @@ class StereoAcousticFeatureExtractor(nn.Module):
                     comb_at_peak = torch.gather(comb_salience, dim=-1, index=peak_bin.unsqueeze(-1))
                     h1_at_peak = torch.gather(h1_salience, dim=-1, index=peak_bin.unsqueeze(-1))
                     is_true_secondary = (
-                        (rel_val > 0.56)
-                        & (peak_val.unsqueeze(-1) > 0.42)
-                        & (acf_at_peak > 0.30)
-                        & (comb_at_peak > 0.22)
-                        & (h1_at_peak > 0.25)
+                        (rel_val > 0.36)
+                        & (peak_val.unsqueeze(-1) > 0.26)
+                        & (acf_at_peak > 0.14)
+                        & (comb_at_peak > 0.14)
+                        & (h1_at_peak > 0.08)
                         & (ref_voicing.unsqueeze(-1) > 0.5)
                     ).float()
                     if T >= 3:
@@ -843,7 +848,7 @@ class StereoAcousticFeatureExtractor(nn.Module):
         Speaker- and pitch-destroying acoustic perturbation for disentangled phonetic content:
           - Random stereo L/R swap & Mid/Side width mixing
           - Piecewise-linear VTLN formant scaling + global Mel shift (disrupts F0 & vocal tract length)
-          - Random frequency-axis Gaussian blur (smoothes away discrete F0 harmonic peaks)
+          - Random frequency-axis Gaussian blur (smoothes away discrete F0 harmonic peaks & source accent formants)
           - Random spectral tilt + smooth 8-knot parametric EQ + light noise
         """
         with torch.amp.autocast(device_type=lr_log_mel.device.type, enabled=False):
@@ -856,7 +861,6 @@ class StereoAcousticFeatureExtractor(nn.Module):
                 keep_clean = torch.rand(B, 1, 1, device=device) < clean_prob
                 strength = torch.where(keep_clean, torch.zeros_like(strength), strength)
 
-            # 1. Stereo pan / width randomization
             mid = 0.5 * (mel_f32[:, 0:1] + mel_f32[:, 1:2])
             side = 0.5 * (mel_f32[:, 0:1] - mel_f32[:, 1:2])
             flip = torch.where(
@@ -867,7 +871,6 @@ class StereoAcousticFeatureExtractor(nn.Module):
             side_scale = 1.0 + strength.view(B, 1, 1, 1) * torch.empty(B, 1, 1, 1, device=device).uniform_(-0.90, 0.35)
             mel_mix = torch.cat([mid + flip * side_scale * side, mid - flip * side_scale * side], dim=1)
 
-            # 2. Piecewise VTLN formant warp + global Mel pitch shift
             vtln_alpha = 1.0 + strength * torch.empty(B, 1, 1, device=device).uniform_(-0.22, 0.25)
             pivot = torch.empty(B, 1, 1, device=device).uniform_(0.25, 0.65)
             base_01 = torch.linspace(0.0, 1.0, M, device=device).view(1, 1, M)
@@ -888,8 +891,7 @@ class StereoAcousticFeatureExtractor(nn.Module):
                 flat_x, flat_grid, mode="bilinear", padding_mode="border", align_corners=True
             ).view(B, C, T, M)
 
-            # 3. Frequency-axis Gaussian blur (destroys F0 harmonic ripples while preserving formants)
-            sigma = strength.view(B, 1) * torch.empty(B, 1, device=device).uniform_(0.0, 1.6)
+            sigma = strength.view(B, 1) * torch.empty(B, 1, device=device).uniform_(0.0, 1.8)
             offsets = torch.arange(-3, 4, device=device, dtype=torch.float32).view(1, 7)
             k_gauss = torch.where(
                 sigma > 1e-3,
@@ -900,7 +902,6 @@ class StereoAcousticFeatureExtractor(nn.Module):
             w_pad = F.pad(warped.reshape(B * C, T, M), (3, 3), mode="replicate").view(B, C, T, M + 6)
             blurred = (w_pad.unfold(-1, 7, 1) * k_gauss).sum(dim=-1)
 
-            # 4. Random spectral tilt + smooth 8-knot EQ + light noise on non-silent frames
             non_silent = (mel_f32.amax(dim=-1, keepdim=True) > -10.5).float()
             tilt_axis = torch.linspace(-1.0, 1.0, M, device=device).view(1, 1, 1, M)
             tilt = strength.view(B, 1, 1, 1) * torch.empty(B, 1, 1, 1, device=device).uniform_(-0.75, 0.75) * tilt_axis
@@ -1060,10 +1061,9 @@ class StereoRoFormerPitchTracker(nn.Module):
     Zero Python frame loops (`for t in range(T)`) and zero blocking `.item()` GPU syncs:
       - Predicts `f0_logits [B, T, 240]`, `gate_logits [B, T, 240]`, sub-bin `fine_offset`,
         and `bin_pan` using a lightweight depthwise-separable lateral inhibition head.
-      - Extracts the primary vocal track plus up to 2 simultaneous secondary harmony/double
-        tracks via 3 vectorized harmonic-sieve passes, orders secondary tracks canonically by
-        signed pitch offset from the lead vocal so tracks never swap identities, and holds
-        inactive frame pitches smoothly via a single Nadaraya-Watson normalized 1D convolution.
+      - Extracts the primary vocal track plus up to 3 simultaneous secondary harmony/double
+        tracks via harmonic-sieve passes on the multi-label `multi_voice_gate` field so
+        softmax normalization never suppresses quieter simultaneous pitches.
     """
 
     def __init__(self, cfg: SVCConfig):
@@ -1130,55 +1130,59 @@ class StereoRoFormerPitchTracker(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, N_bins = f0_logits.shape
         device = f0_logits.device
+        V = int(getattr(self.cfg, "max_polyphony", 4))
         log2_grid = self.log2_f0_grid.to(device, dtype=torch.float32).view(1, 1, N_bins)
         bin_idx = torch.arange(N_bins, device=device).view(1, 1, N_bins)
         full_probs = F.softmax(f0_logits, dim=-1)
         sieve_mat = self.nms_sieve.to(device, dtype=torch.float32)
 
         with torch.no_grad():
-            score_field = full_probs * (0.4 + 0.6 * multi_voice_gate)
+            prob_norm = full_probs / full_probs.amax(dim=-1, keepdim=True).clamp(min=1e-6)
+            lead_score = prob_norm * (0.4 + 0.6 * multi_voice_gate)
+            sec_score = multi_voice_gate * (0.35 + 0.65 * prob_norm)
+
             if T >= 3:
-                sf_t = score_field.permute(0, 2, 1).reshape(B * N_bins, 1, T)
                 k3 = torch.tensor([0.25, 0.50, 0.25], device=device, dtype=torch.float32).view(1, 1, 3)
-                score_field = F.conv1d(F.pad(sf_t, (1, 1), mode="replicate"), k3).view(B, N_bins, T).permute(0, 2, 1)
+                ls_t = lead_score.permute(0, 2, 1).reshape(B * N_bins, 1, T)
+                lead_score = F.conv1d(F.pad(ls_t, (1, 1), mode="replicate"), k3).view(B, N_bins, T).permute(0, 2, 1)
+                ss_t = sec_score.permute(0, 2, 1).reshape(B * N_bins, 1, T)
+                sec_score = F.conv1d(F.pad(ss_t, (1, 1), mode="replicate"), k3).view(B, N_bins, T).permute(0, 2, 1)
 
-            res_score = score_field.clone()
-            max_val_0, peak_bin_0 = res_score.max(dim=-1)
-            res_score = res_score * (1.0 - 0.92 * sieve_mat[peak_bin_0])
+            _, peak_bin_0 = lead_score.max(dim=-1)
+            res_sec = sec_score * (1.0 - 0.92 * sieve_mat[peak_bin_0])
+            max_sec_0 = torch.gather(multi_voice_gate, dim=-1, index=peak_bin_0.unsqueeze(-1)).squeeze(-1).clamp(min=0.35)
 
-            val_1, bin_1 = res_score.max(dim=-1)
-            gate_1 = torch.gather(multi_voice_gate, dim=-1, index=bin_1.unsqueeze(-1)).squeeze(-1)
-            rel_1 = val_1 / max_val_0.clamp(min=1e-6)
-            act_1 = ((gate_1 > 0.55) & (rel_1 > 0.36) & (periodicity > 0.40)).float()
-            res_score = res_score * (1.0 - 0.92 * sieve_mat[bin_1])
+            sec_bins_list = []
+            sec_acts_list = []
+            for _ in range(V - 1):
+                val_k, bin_k = res_sec.max(dim=-1)
+                gate_k = torch.gather(multi_voice_gate, dim=-1, index=bin_k.unsqueeze(-1)).squeeze(-1)
+                rel_k = gate_k / max_sec_0
+                act_k = ((gate_k > 0.42) & (rel_k > 0.25) & (val_k > 0.18) & (periodicity > 0.35)).float()
+                sec_bins_list.append(bin_k)
+                sec_acts_list.append(act_k)
+                res_sec = res_sec * (1.0 - 0.92 * sieve_mat[bin_k])
 
-            val_2, bin_2 = res_score.max(dim=-1)
-            gate_2 = torch.gather(multi_voice_gate, dim=-1, index=bin_2.unsqueeze(-1)).squeeze(-1)
-            rel_2 = val_2 / max_val_0.clamp(min=1e-6)
-            act_2 = ((gate_2 > 0.55) & (rel_2 > 0.36) & (periodicity > 0.40)).float()
+            sec_bins = torch.stack(sec_bins_list, dim=1)
+            sec_acts = torch.stack(sec_acts_list, dim=1)
 
             if T >= 3:
-                sec_act = torch.stack([act_1, act_2], dim=1)
-                sec_min = -F.max_pool1d(-F.pad(sec_act, (1, 1), mode="replicate"), kernel_size=3, stride=1)
-                sec_clean = F.max_pool1d(F.pad(sec_min, (1, 1), mode="replicate"), kernel_size=3, stride=1)
-                act_1, act_2 = sec_clean[:, 0], sec_clean[:, 1]
+                sec_min = -F.max_pool1d(-F.pad(sec_acts, (1, 1), mode="replicate"), kernel_size=3, stride=1)
+                sec_acts = F.max_pool1d(F.pad(sec_min, (1, 1), mode="replicate"), kernel_size=3, stride=1)
 
-            eff_bin_1 = torch.where(act_1 > 0.5, bin_1, peak_bin_0)
-            eff_bin_2 = torch.where(act_2 > 0.5, bin_2, peak_bin_0)
-            swap_mask = eff_bin_1 < eff_bin_2
-            hi_bin = torch.where(swap_mask, bin_2, bin_1)
-            lo_bin = torch.where(swap_mask, bin_1, bin_2)
-            hi_act = torch.where(swap_mask, act_2, act_1)
-            lo_act = torch.where(swap_mask, act_1, act_2)
+            eff_bins = torch.where(sec_acts > 0.5, sec_bins, peak_bin_0.unsqueeze(1))
+            _, sort_idx = torch.sort(eff_bins, dim=1, descending=True)
+            sorted_sec_bins = torch.gather(sec_bins, dim=1, index=sort_idx)
+            sorted_sec_acts = torch.gather(sec_acts, dim=1, index=sort_idx)
 
-            lead_act = (periodicity > 0.35).float()
-            cand_bins = torch.stack([peak_bin_0, hi_bin, lo_bin], dim=1)
-            cand_active = torch.stack([lead_act, hi_act, lo_act], dim=1)
+            lead_act = (periodicity > 0.35).float().unsqueeze(1)
+            cand_bins = torch.cat([peak_bin_0.unsqueeze(1), sorted_sec_bins], dim=1)
+            cand_active = torch.cat([lead_act, sorted_sec_acts], dim=1)
 
-        V = 3
         p_bins = cand_bins.unsqueeze(-1)
         window_mask = ((bin_idx.unsqueeze(1) - p_bins).abs() <= 6).float()
-        masked_probs = full_probs.unsqueeze(1) * window_mask
+        salience_field = full_probs.unsqueeze(1) * 0.35 + multi_voice_gate.unsqueeze(1) * 0.65
+        masked_probs = salience_field * window_mask
         sum_window = masked_probs.sum(dim=-1, keepdim=True).clamp(min=1e-7)
         local_probs = masked_probs / sum_window
 
@@ -1259,7 +1263,7 @@ class StereoRoFormerPitchTracker(nn.Module):
         raw_fine = bin_out[:, :, 2, :]
         raw_pan = bin_out[:, :, 3, :]
 
-        acoustic_prior = 0.60 * acf_salience.float() + 0.40 * comb_salience.float()
+        acoustic_prior = 0.50 * acf_salience.float() + 0.50 * comb_salience.float()
         f0_logits = raw_logits + self.salience_skip_gain.float() * acoustic_prior
         gate_logits = raw_gate + 2.0 * acoustic_prior - 1.2
 
@@ -1308,6 +1312,7 @@ class StereoContentEncoder(nn.Module):
     def __init__(self, cfg: SVCConfig):
         super().__init__()
         self.fsq_levels = int(getattr(cfg, "fsq_levels", 15))
+        self.raw_accent_sigma = nn.Parameter(torch.tensor(-0.35))
         self.in_proj = nn.Linear(cfg.n_mels * 3, cfg.dim)
         self.conv_stem = nn.Sequential(
             nn.Conv1d(cfg.dim, cfg.dim, kernel_size=5, padding=2, groups=cfg.dim),
@@ -1327,6 +1332,17 @@ class StereoContentEncoder(nn.Module):
         self.out_norm = RMSNorm(cfg.dim)
         self.bottleneck = nn.Linear(cfg.dim, cfg.content_dim, bias=False)
 
+    def _learned_accent_blur(self, lr_log_mel: torch.Tensor) -> torch.Tensor:
+        """Differentiable frequency-axis Gaussian blur with learned bandwidth to neutralize source accent."""
+        sigma = 1.25 * torch.sigmoid(self.raw_accent_sigma.float()) + 0.05
+        mel_f32 = lr_log_mel.float()
+        B, C, T, M = mel_f32.shape
+        offsets = torch.arange(-3, 4, device=mel_f32.device, dtype=torch.float32)
+        k_gauss = torch.exp(-0.5 * (offsets / sigma) ** 2)
+        k_gauss = (k_gauss / k_gauss.sum().clamp(min=1e-6)).view(1, 1, 1, 1, 7)
+        w_pad = F.pad(mel_f32.reshape(B * C, T, M), (3, 3), mode="replicate").view(B, C, T, M + 6)
+        return (w_pad.unfold(-1, 7, 1) * k_gauss).sum(dim=-1)
+
     @staticmethod
     def _frame_norm(mel: torch.Tensor) -> torch.Tensor:
         """Gain- and chunk-length-invariant per-frame spectral normalization."""
@@ -1338,9 +1354,10 @@ class StereoContentEncoder(nn.Module):
     def forward(
         self, lr_log_mel: torch.Tensor, return_continuous: bool = False
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        mel_l = self._frame_norm(lr_log_mel[:, 0])
-        mel_r = self._frame_norm(lr_log_mel[:, 1])
-        mel_mid = self._frame_norm(0.5 * (lr_log_mel[:, 0] + lr_log_mel[:, 1]))
+        mel_blurred = self._learned_accent_blur(lr_log_mel)
+        mel_l = self._frame_norm(mel_blurred[:, 0])
+        mel_r = self._frame_norm(mel_blurred[:, 1])
+        mel_mid = self._frame_norm(0.5 * (mel_blurred[:, 0] + mel_blurred[:, 1]))
         x_cat = torch.cat([mel_l, mel_r, mel_mid], dim=-1).to(self.in_proj.weight.dtype)
 
         x = self.in_proj(x_cat)
@@ -1373,7 +1390,7 @@ class StereoPitchEnergyConditioner(nn.Module):
         freqs = torch.exp(torch.linspace(0.0, math.log(64.0), 32))
         self.register_buffer("freqs", freqs, persistent=False)
         self.mlp = nn.Sequential(
-            nn.Linear(139, cfg.dim),
+            nn.Linear(140, cfg.dim),
             nn.GELU(),
             nn.Linear(cfg.dim, cfg.dim),
             RMSNorm(cfg.dim),
@@ -1400,6 +1417,11 @@ class StereoPitchEnergyConditioner(nn.Module):
         sec_log_f0 = (log_f0[:, 1:].unsqueeze(-1) * w[:, 1:]).sum(dim=1)
         sec_pan = (track_pan[:, 1:].float().unsqueeze(-1) * w[:, 1:]).sum(dim=1)
 
+        amp_3 = track_amp[:, :3].float().transpose(1, 2)
+        if amp_3.shape[-1] < 3:
+            amp_3 = F.pad(amp_3, (0, 3 - amp_3.shape[-1]))
+        sec_extra = track_amp[:, 3:].float().sum(dim=1, keepdim=True).transpose(1, 2)
+
         feat = torch.cat(
             [
                 lead_fourier,
@@ -1409,12 +1431,93 @@ class StereoPitchEnergyConditioner(nn.Module):
                 sec_log_f0,
                 sec_pan,
                 periodicity.float().unsqueeze(-1),
-                track_amp.float().transpose(1, 2),
+                amp_3,
+                sec_extra,
                 (stereo_energy.float() + 4.0) / 4.0,
             ],
             dim=-1,
         )
         return self.mlp(feat.to(self.mlp[0].weight.dtype))
+
+
+class SingerStyleProsodyPredictor(nn.Module):
+    """
+    Learns the trained singer's expressive micro-pitch inflection (vibrato, note-onset scoops,
+    slides), phrasing dynamics (swells, breathy attacks), and per-frame confidence gate `style_gate`
+    conditioned on phonetic content, macro-melody, macro-energy, and `target_singer_emb`.
+    """
+
+    def __init__(self, cfg: SVCConfig):
+        super().__init__()
+        self.cfg = cfg
+        in_dim = cfg.content_dim + 4 + 3 + 1 + cfg.dim
+        self.in_proj = nn.Linear(in_dim, cfg.dim)
+        self.conv_stem = nn.Sequential(
+            nn.Conv1d(cfg.dim, cfg.dim, kernel_size=7, padding=3, groups=cfg.dim),
+            nn.GELU(),
+            nn.Conv1d(cfg.dim, cfg.dim, kernel_size=1),
+        )
+        self.blocks = nn.ModuleList([
+            XSARoPETransformerBlock(
+                dim=cfg.dim,
+                num_heads=cfg.num_heads,
+                ffn_mult=cfg.ffn_mult,
+                rope_theta=cfg.rope_theta,
+                dropout=cfg.dropout,
+            )
+            for _ in range(2)
+        ])
+        self.out_norm = RMSNorm(cfg.dim)
+        self.delta_f0_head = nn.Linear(cfg.dim, cfg.max_polyphony)
+        self.delta_energy_head = nn.Linear(cfg.dim, 3)
+        self.style_gate_head = nn.Linear(cfg.dim, 1)
+        nn.init.zeros_(self.delta_f0_head.weight)
+        nn.init.zeros_(self.delta_f0_head.bias)
+        nn.init.zeros_(self.delta_energy_head.weight)
+        nn.init.zeros_(self.delta_energy_head.bias)
+        nn.init.zeros_(self.style_gate_head.weight)
+        nn.init.constant_(self.style_gate_head.bias, 0.5)
+
+    def forward(
+        self,
+        z_content: torch.Tensor,
+        macro_f0_hz: torch.Tensor,
+        track_amp: torch.Tensor,
+        periodicity: torch.Tensor,
+        macro_energy: torch.Tensor,
+        target_singer_emb: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, _ = z_content.shape
+        V = macro_f0_hz.shape[1]
+        macro_log2 = torch.log2(macro_f0_hz.float().clamp(min=1.0) / 220.0).transpose(1, 2)
+        if macro_log2.shape[-1] < 4:
+            macro_log2 = F.pad(macro_log2, (0, 4 - macro_log2.shape[-1]))
+        else:
+            macro_log2 = macro_log2[..., :4]
+        macro_log2 = macro_log2 * track_amp.float().transpose(1, 2)[..., :4]
+
+        singer_expand = target_singer_emb.expand(B, T, -1).to(z_content.dtype)
+        feat = torch.cat(
+            [
+                z_content.float(),
+                macro_log2,
+                (macro_energy.float() + 4.0) / 4.0,
+                periodicity.float().unsqueeze(-1),
+                singer_expand.float(),
+            ],
+            dim=-1,
+        ).to(self.in_proj.weight.dtype)
+
+        x = self.in_proj(feat)
+        x = x + self.conv_stem(x.transpose(1, 2)).transpose(1, 2)
+        for blk in self.blocks:
+            x = blk(x)
+        h = self.out_norm(x).float()
+
+        delta_log2_f0 = (0.25 * torch.tanh(self.delta_f0_head(h))).transpose(1, 2)[:, :V, :]
+        delta_energy = 1.5 * torch.tanh(self.delta_energy_head(h))
+        style_gate = torch.sigmoid(self.style_gate_head(h))
+        return delta_log2_f0, delta_energy, style_gate
 
 
 class Snake1d(nn.Module):
@@ -1525,11 +1628,11 @@ class StereoWaveformRefiner(nn.Module):
 class StereoHarmonicPlusNoiseSynthesizer(nn.Module):
     """
     Low-VRAM, High-Speed Sample-Rate (44.1 kHz) Time-Domain Polyphonic Harmonic + Formant Synthesizer:
-      - Integrates instantaneous phase (`cumsum`) strictly on the 3 fundamental voice trajectories
-        `[B, V, L]`, synthesizing 128 harmonics in 32-harmonic checkpointed slices.
+      - Integrates instantaneous phase (`cumsum`) strictly on the fundamental voice trajectories
+        `[B, V, L]`, synthesizing 128 harmonics per active voice in 32-harmonic checkpointed slices.
       - Uses L2 Parseval normalization for RMS-exact harmonic amplitudes and learnable glottal phase.
-      - Shapes vocal timbre with a 96-band Mel-spaced vocal-tract formant filter (43 dB range) and
-        a sample-rate short-receptive-field Snake Neural Source-Filter refiner.
+      - Shapes vocal timbre with a 96-band Mel-spaced vocal-tract formant filter and a
+        sample-rate short-receptive-field Snake Neural Source-Filter refiner.
     """
 
     def __init__(self, cfg: SVCConfig):
@@ -1599,8 +1702,8 @@ class StereoHarmonicPlusNoiseSynthesizer(nn.Module):
                 pan_r = amp_v_up[:, 0:1, :]
             else:
                 pan_angle = (pan_v_up[:, v_idx : v_idx + 1, :].clamp(-1.0, 1.0) + 1.0) * (math.pi / 4.0)
-                pan_l = amp_v_up[:, v_idx : v_idx + 1, :] * torch.cos(pan_angle) * 0.85
-                pan_r = amp_v_up[:, v_idx : v_idx + 1, :] * torch.sin(pan_angle) * 0.85
+                pan_l = amp_v_up[:, v_idx : v_idx + 1, :] * torch.cos(pan_angle) * 0.90
+                pan_r = amp_v_up[:, v_idx : v_idx + 1, :] * torch.sin(pan_angle) * 0.90
 
             sig_l = torch.zeros(B, 1, target_length, device=device, dtype=torch.float32)
             sig_r = torch.zeros(B, 1, target_length, device=device, dtype=torch.float32)
@@ -1782,7 +1885,7 @@ class SingingVoiceConverter(nn.Module):
     """
     Full Native Stereo Polyphonic Singing Voice Conversion model (44.1 kHz) with
     learned sparse polyphonic RoFormer pitch tracking, speaker-invariant FSQ content
-    encoding, and low-VRAM sample-rate synthesis + Snake waveform refinement.
+    encoding, learned cover-style prosody/accent transfer, and Snake waveform refinement.
     """
 
     def __init__(self, cfg: SVCConfig):
@@ -1793,6 +1896,7 @@ class SingingVoiceConverter(nn.Module):
         self.content_encoder = StereoContentEncoder(cfg)
         self.content_proj = nn.Linear(cfg.content_dim, cfg.dim)
         self.pitch_cond = StereoPitchEnergyConditioner(cfg)
+        self.style_predictor = SingerStyleProsodyPredictor(cfg)
 
         self.target_singer_emb = nn.Parameter(torch.randn(1, 1, cfg.dim) * 0.02)
 
@@ -1815,23 +1919,62 @@ class SingingVoiceConverter(nn.Module):
         self.synthesizer = StereoHarmonicPlusNoiseSynthesizer(cfg)
 
         self.register_buffer("target_f0_median", torch.tensor(220.0))
+        self.register_buffer("target_f0_p10", torch.tensor(165.0))
+        self.register_buffer("target_f0_p90", torch.tensor(350.0))
         self.register_buffer("target_f0_std", torch.tensor(50.0))
         self.register_buffer("has_f0_stats", torch.tensor(False))
         self.register_buffer("target_rms", torch.tensor(0.08))
         self.register_buffer("has_rms_stats", torch.tensor(False))
+
+        k_t = torch.arange(-8, 9, dtype=torch.float32)
+        macro_kernel = torch.exp(-0.5 * (k_t / 4.0) ** 2)
+        macro_kernel = macro_kernel / macro_kernel.sum()
+        self.register_buffer("macro_kernel", macro_kernel.view(1, 1, -1), persistent=False)
+
+    def _decompose_macro_micro(
+        self,
+        track_f0_hz: torch.Tensor,
+        track_amp: torch.Tensor,
+        stereo_energy: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Splits F0 and energy into ~180 ms macro melody/dynamics and micro inflection residuals."""
+        B, V, T = track_f0_hz.shape
+        log2_f0 = torch.log2(track_f0_hz.float().clamp(min=1.0))
+        if T < 5:
+            return track_f0_hz, torch.zeros_like(log2_f0), stereo_energy, torch.zeros_like(stereo_energy)
+
+        mk = self.macro_kernel.to(device=track_f0_hz.device, dtype=torch.float32)
+        pad_r = mk.shape[-1] // 2
+        w = track_amp.float().clamp(min=0.0) + 1e-3
+        num = F.conv1d(F.pad((log2_f0 * w).reshape(B * V, 1, T), (pad_r, pad_r), mode="replicate"), mk).view(B, V, T)
+        den = F.conv1d(F.pad(w.reshape(B * V, 1, T), (pad_r, pad_r), mode="replicate"), mk).view(B, V, T)
+        macro_log2 = num / den.clamp(min=1e-6)
+        delta_log2_f0 = (log2_f0 - macro_log2).clamp(-0.25, 0.25)
+        macro_f0_hz = 2.0 ** macro_log2
+
+        e_t = stereo_energy.float().transpose(1, 2)
+        macro_e = F.conv1d(F.pad(e_t.reshape(B * 3, 1, T), (pad_r, pad_r), mode="replicate"), mk).view(B, 3, T).transpose(1, 2)
+        delta_energy = (stereo_energy.float() - macro_e).clamp(-1.5, 1.5)
+        return macro_f0_hz, delta_log2_f0, macro_e, delta_energy
 
     @torch.no_grad()
     def update_f0_stats(self, f0_hz: torch.Tensor, wav: Optional[torch.Tensor] = None) -> None:
         voiced = f0_hz.detach()[f0_hz.detach() > 1.0]
         if voiced.numel() > 16:
             med = voiced.median()
+            p10 = torch.quantile(voiced.float(), 0.10)
+            p90 = torch.quantile(voiced.float(), 0.90)
             std = voiced.std().clamp(min=5.0)
             if not bool(self.has_f0_stats.item()):
                 self.target_f0_median.copy_(med)
+                self.target_f0_p10.copy_(p10)
+                self.target_f0_p90.copy_(p90)
                 self.target_f0_std.copy_(std)
                 self.has_f0_stats.fill_(True)
             else:
                 self.target_f0_median.mul_(0.98).add_(med * 0.02)
+                self.target_f0_p10.mul_(0.98).add_(p10 * 0.02)
+                self.target_f0_p90.mul_(0.98).add_(p90 * 0.02)
                 self.target_f0_std.mul_(0.98).add_(std * 0.02)
 
         if wav is not None:
@@ -1843,15 +1986,15 @@ class SingingVoiceConverter(nn.Module):
                 self.target_rms.mul_(0.98).add_(rms * 0.02)
 
     @staticmethod
-    def _roll_pad_last(x: torch.Tensor, shift: int) -> torch.Tensor:
+    def _roll_pad_last(x: torch.Tensor, shift: int, zero_pad: bool = False) -> torch.Tensor:
         if shift == 0:
             return x
         if shift > 0:
-            pad_edge = x[..., :1].expand(*x.shape[:-1], shift)
+            pad_edge = torch.zeros(*x.shape[:-1], shift, device=x.device, dtype=x.dtype) if zero_pad else x[..., :1].expand(*x.shape[:-1], shift)
             return torch.cat([pad_edge, x[..., :-shift]], dim=-1)
         else:
             s = -shift
-            pad_edge = x[..., -1:].expand(*x.shape[:-1], s)
+            pad_edge = torch.zeros(*x.shape[:-1], s, device=x.device, dtype=x.dtype) if zero_pad else x[..., -1:].expand(*x.shape[:-1], s)
             return torch.cat([x[..., s:], pad_edge], dim=-1)
 
     def _shift_pitch_features(
@@ -1875,8 +2018,25 @@ class SingingVoiceConverter(nn.Module):
 
     def forward_train(self, wav: torch.Tensor) -> Dict[str, torch.Tensor]:
         B, C, L = wav.shape
-        target_lr_mel, target_ms_mel, _ = self.extractor.compute_stereo_log_mel(wav)
-        pitch_cues = self.extractor.extract_pitch_salience_and_stereo_energy(wav)
+
+        with torch.no_grad():
+            clean_cues = self.extractor.extract_pitch_salience_and_stereo_energy(wav)
+            clean_bins = (0.50 * clean_cues["acf_salience"] + 0.50 * clean_cues["comb_salience"]).argmax(dim=-1)
+            clean_f0 = torch.where(
+                clean_cues["ref_voicing"] > 0.5,
+                self.extractor.f0_grid_hz.to(wav.device)[clean_bins],
+                torch.zeros_like(clean_cues["ref_voicing"]),
+            )
+            self.update_f0_stats(clean_f0, wav=wav)
+
+        train_wav = wav
+        if self.training and B >= 2 and random.random() < 0.25:
+            partner = torch.roll(wav, shifts=1, dims=0)
+            mix_gain = torch.empty(B, 1, 1, device=wav.device).uniform_(0.45, 0.75)
+            train_wav = (0.72 * wav + mix_gain * partner).clamp(-0.99, 0.99)
+
+        target_lr_mel, target_ms_mel, _ = self.extractor.compute_stereo_log_mel(train_wav)
+        pitch_cues = self.extractor.extract_pitch_salience_and_stereo_energy(train_wav)
 
         acf_salience = pitch_cues["acf_salience"]
         comb_salience = pitch_cues["comb_salience"]
@@ -1910,18 +2070,15 @@ class SingingVoiceConverter(nn.Module):
         track_pan = pitch_out["track_pan"]
         periodicity = pitch_out["periodicity"]
         voicing_logit = pitch_out["voicing_logit"]
-        f0_hz = pitch_out["f0_hz"]
 
-        self.update_f0_stats(f0_hz, wav=wav)
-
-        shift_bins = random.choice([-18, -12, -8, -5, 5, 8, 12, 18])
+        shift_bins = random.choice([-60, -48, -36, -24, -12, 12, 24, 36, 48, 60])
         sh_lr, sh_ms, sh_acf, sh_comb, sh_pan = self._shift_pitch_features(
             target_lr_mel[:1], target_ms_mel[:1], acf_salience[:1], comb_salience[:1], pan_salience[:1], shift_bins
         )
         shifted_pitch_out = self.pitch_tracker(sh_lr, sh_ms, sh_acf, sh_comb, sh_pan, stereo_energy[:1])
 
         aug_mel_1 = self.extractor.augment_mel_for_content(
-            target_lr_mel, strength_range=(0.0, 0.85), clean_prob=0.15
+            target_lr_mel, strength_range=(0.0, 0.90), clean_prob=0.12
         )
         aug_mel_2 = self.extractor.augment_mel_for_content(
             target_lr_mel, strength_range=(0.45, 1.0), clean_prob=0.0
@@ -1932,6 +2089,19 @@ class SingingVoiceConverter(nn.Module):
 
         soft_gate = torch.sigmoid((periodicity - 0.30) * 12.0).unsqueeze(1)
         gated_track_amp = track_amp * soft_gate
+
+        with torch.no_grad():
+            macro_f0_hz, target_delta_f0, macro_energy, target_delta_energy = self._decompose_macro_micro(
+                track_f0_hz.detach(), gated_track_amp.detach(), stereo_energy.detach()
+            )
+        pred_delta_f0, pred_delta_energy, style_gate = self.style_predictor(
+            z_aug1.detach(),
+            macro_f0_hz,
+            gated_track_amp.detach(),
+            periodicity.detach(),
+            macro_energy,
+            self.target_singer_emb,
+        )
 
         cond = (
             self.content_proj(z_aug1)
@@ -1953,6 +2123,7 @@ class SingingVoiceConverter(nn.Module):
             target_length=L,
         )
         return {
+            "target_wav": train_wav,
             "pred_wav": pred_wav,
             "pred_lr_mel": pred_lr_mel,
             "target_lr_mel": target_lr_mel,
@@ -1973,6 +2144,12 @@ class SingingVoiceConverter(nn.Module):
             "ref_multi_activity": ref_multi_activity,
             "ref_voicing": ref_voicing,
             "ref_conf": ref_conf,
+            "pred_delta_f0": pred_delta_f0,
+            "target_delta_f0": target_delta_f0,
+            "pred_delta_energy": pred_delta_energy,
+            "target_delta_energy": target_delta_energy,
+            "style_gate": style_gate,
+            "gated_track_amp": gated_track_amp.detach(),
         }
 
     @torch.no_grad()
@@ -1982,41 +2159,50 @@ class SingingVoiceConverter(nn.Module):
         pitch_shift_semitones: float = 0.0,
         auto_f0_adjust: bool = True,
     ) -> float:
-        scale = 2.0 ** (float(pitch_shift_semitones) / 12.0)
+        manual_scale = 2.0 ** (float(pitch_shift_semitones) / 12.0)
         if not auto_f0_adjust or not bool(self.has_f0_stats.item()):
-            return scale
+            return manual_scale
 
-        max_probe_len = min(full_wav.shape[-1], self.cfg.sample_rate * 24)
-        probe_wav = full_wav[:, :max_probe_len]
-        chunk_len = self.cfg.sample_rate * 6
+        total_len = full_wav.shape[-1]
+        chunk_len = self.cfg.sample_rate * 4
+        max_chunks = 8
+        if total_len <= chunk_len:
+            starts = [0]
+        else:
+            step = max(chunk_len, (total_len - chunk_len) // max(1, max_chunks - 1))
+            starts = list(range(0, total_len - chunk_len + 1, step))[:max_chunks]
+
         voiced_vals = []
-        for s in range(0, probe_wav.shape[-1], chunk_len):
-            seg = probe_wav[:, s : s + chunk_len]
+        f0_grid = self.extractor.f0_grid_hz.to(full_wav.device)
+        for s in starts:
+            seg = full_wav[:, s : min(total_len, s + chunk_len)]
             if seg.shape[-1] < self.cfg.n_fft:
                 continue
-            lr_mel, ms_mel, _ = self.extractor.compute_stereo_log_mel(seg.unsqueeze(0))
             cues = self.extractor.extract_pitch_salience_and_stereo_energy(seg.unsqueeze(0))
-            T = min(lr_mel.shape[2], cues["acf_salience"].shape[1])
-            p_out = self.pitch_tracker(
-                lr_mel[:, :, :T],
-                ms_mel[:, :, :T],
-                cues["acf_salience"][:, :T],
-                cues["comb_salience"][:, :T],
-                cues["pan_salience"][:, :T],
-                cues["stereo_energy"][:, :T],
-            )
-            f0_seg = p_out["f0_hz"][0]
-            v = f0_seg[f0_seg > 1.0]
+            joint = 0.50 * cues["acf_salience"][0] + 0.50 * cues["comb_salience"][0]
+            peak_bins = joint.argmax(dim=-1)
+            dsp_f0 = f0_grid[peak_bins]
+            voiced_mask = (cues["ref_voicing"][0] > 0.5) & (cues["ref_conf"][0] > 0.25)
+            v = dsp_f0[voiced_mask]
             if v.numel() > 0:
                 voiced_vals.append(v)
 
+        scale = manual_scale
         if voiced_vals:
             all_voiced = torch.cat(voiced_vals, dim=0)
             if all_voiced.numel() > 8:
-                src_med = all_voiced.median().clamp(min=1.0)
-                tgt_med = self.target_f0_median.clamp(min=1.0)
-                semi_diff = max(-18, min(18, round(12.0 * math.log2(float((tgt_med / src_med).item())))))
-                scale = scale * (2.0 ** (semi_diff / 12.0))
+                src_med = float((2.0 ** torch.median(torch.log2(all_voiced.clamp(min=1.0)))).item())
+                tgt_med = float(self.target_f0_median.clamp(min=1.0).item())
+                tgt_p10 = float(self.target_f0_p10.clamp(min=1.0).item())
+                tgt_p90 = float(self.target_f0_p90.clamp(min=1.0).item())
+                raw_semi = 12.0 * math.log2(tgt_med / max(1.0, src_med))
+                semi_diff = max(-24, min(24, int(round(raw_semi))))
+                scale = manual_scale * (2.0 ** (semi_diff / 12.0))
+                print(
+                    f"[Pitch Match] Source median F0: {src_med:.1f} Hz | "
+                    f"Target median F0: {tgt_med:.1f} Hz (p10-p90: {tgt_p10:.1f}-{tgt_p90:.1f} Hz) | "
+                    f"Auto shift: {semi_diff:+d} semitones (total scale: {scale:.3f}x)"
+                )
         return scale
 
     @torch.no_grad()
@@ -2056,10 +2242,25 @@ class SingingVoiceConverter(nn.Module):
         pan_salience = pan_salience[:, :T, :]
         stereo_energy = stereo_energy[:, :T, :]
 
+        pre_shift_bins = 0
+        if abs(math.log2(max(1e-3, float(f0_scale)))) > 0.15:
+            pre_shift_bins = int(round(math.log2(float(f0_scale)) / self.extractor.bin_step_log2))
+            pre_shift_bins = max(-120, min(120, pre_shift_bins))
+
+        if pre_shift_bins != 0:
+            pt_lr, pt_ms, pt_acf, pt_comb, pt_pan = self._shift_pitch_features(
+                src_lr_mel, src_ms_mel, acf_salience, comb_salience, pan_salience, pre_shift_bins
+            )
+            pre_scale = 2.0 ** (float(pre_shift_bins) * self.extractor.bin_step_log2)
+            residual_scale = float(f0_scale) / pre_scale
+        else:
+            pt_lr, pt_ms, pt_acf, pt_comb, pt_pan = src_lr_mel, src_ms_mel, acf_salience, comb_salience, pan_salience
+            residual_scale = float(f0_scale)
+
         pitch_out = self.pitch_tracker(
-            src_lr_mel, src_ms_mel, acf_salience, comb_salience, pan_salience, stereo_energy
+            pt_lr, pt_ms, pt_acf, pt_comb, pt_pan, stereo_energy
         )
-        track_f0_hz = (pitch_out["track_f0_hz"] * float(f0_scale)).clamp(
+        track_f0_hz = (pitch_out["track_f0_hz"] * residual_scale).clamp(
             self.cfg.f0_min * 0.5, self.cfg.f0_max * 1.5
         )
         track_amp = pitch_out["track_amp"]
@@ -2070,6 +2271,23 @@ class SingingVoiceConverter(nn.Module):
         gated_track_amp = track_amp * soft_gate
 
         z_content = self.content_encoder(src_lr_mel)
+
+        macro_f0_hz, src_delta_f0, macro_energy, src_delta_energy = self._decompose_macro_micro(
+            track_f0_hz, gated_track_amp, stereo_energy
+        )
+        pred_delta_f0, pred_delta_energy, style_gate = self.style_predictor(
+            z_content,
+            macro_f0_hz,
+            gated_track_amp,
+            periodicity,
+            macro_energy,
+            self.target_singer_emb,
+        )
+        g_f0 = style_gate.transpose(1, 2)
+        blended_log2 = torch.log2(macro_f0_hz.clamp(min=1.0)) + (1.0 - g_f0) * src_delta_f0 + g_f0 * pred_delta_f0
+        track_f0_hz = (2.0 ** blended_log2).clamp(self.cfg.f0_min * 0.5, self.cfg.f0_max * 1.5)
+        stereo_energy = macro_energy + (1.0 - style_gate) * src_delta_energy + style_gate * pred_delta_energy
+
         cond = (
             self.content_proj(z_content)
             + self.pitch_cond(track_f0_hz, gated_track_amp, track_pan, periodicity, stereo_energy)
@@ -2101,7 +2319,8 @@ class SingingVoiceConverter(nn.Module):
 class StereoMultiResolutionSVCLoss(nn.Module):
     """
     Polyphonic Stereo Multi-Resolution STFT (Magnitude + Spectral Convergence + Temporal/Spectral Flux)
-    + Phase-Invariant Waveform RMS Envelope + Mel + Two-View VICReg Content + Sparse RoFormer Pitch Field Loss.
+    + Phase-Invariant Waveform RMS Envelope + Mel + Two-View VICReg Content + Sparse RoFormer Pitch Field Loss
+    + Expressive Cover-Style Prosody & Confidence Gate Loss.
     """
 
     def __init__(self, cfg: SVCConfig):
@@ -2176,11 +2395,13 @@ class StereoMultiResolutionSVCLoss(nn.Module):
         voicing_loss = F.binary_cross_entropy_with_logits(voicing_logit, soft_voicing_target)
 
         pred_probs_det = F.softmax(f0_logits[:1].detach(), dim=-1)
-        expected_shifted_probs = SingingVoiceConverter._roll_pad_last(pred_probs_det, shift_bins)
-        expected_shifted_probs = expected_shifted_probs / expected_shifted_probs.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        expected_shifted_raw = SingingVoiceConverter._roll_pad_last(pred_probs_det, shift_bins, zero_pad=True)
+        in_range_mass = expected_shifted_raw.sum(dim=-1)
+        in_range_mask = (in_range_mass > 0.70).float()
+        expected_shifted_probs = expected_shifted_raw / in_range_mass.unsqueeze(-1).clamp(min=1e-6)
         shifted_log_probs = F.log_softmax(shifted_f0_logits, dim=-1)
         equiv_kl = -(expected_shifted_probs * shifted_log_probs).sum(dim=-1)
-        equiv_weights = voiced_weights[:1]
+        equiv_weights = voiced_weights[:1] * in_range_mask
         equiv_loss = (equiv_kl * equiv_weights).sum() / equiv_weights.sum().clamp(min=1.0)
 
         smooth_loss = torch.tensor(0.0, device=f0_logits.device, dtype=torch.float32)
@@ -2198,6 +2419,39 @@ class StereoMultiResolutionSVCLoss(nn.Module):
             )
 
         return 0.50 * dist_loss + 0.80 * gate_loss + 0.40 * voicing_loss + 0.60 * equiv_loss + smooth_loss
+
+    @staticmethod
+    def _compute_style_loss(out: Dict[str, torch.Tensor]) -> torch.Tensor:
+        pred_df0 = out["pred_delta_f0"].float()
+        tgt_df0 = out["target_delta_f0"].float().detach()
+        pred_de = out["pred_delta_energy"].float()
+        tgt_de = out["target_delta_energy"].float().detach()
+        style_gate = out["style_gate"].float().squeeze(-1)
+        w = out["gated_track_amp"].float().detach()
+        w_sum = w.sum().clamp(min=1.0)
+
+        f0_l1 = (F.smooth_l1_loss(pred_df0, tgt_df0, beta=0.02, reduction="none") * w).sum() / w_sum
+        e_l1 = F.smooth_l1_loss(pred_de, tgt_de, beta=0.1)
+
+        with torch.no_grad():
+            lead_err = (pred_df0[:, 0] - tgt_df0[:, 0]).abs()
+            gate_target = torch.exp(-lead_err / 0.035).clamp(0.15, 0.95) * w[:, 0]
+        gate_loss = F.binary_cross_entropy(style_gate.clamp(1e-4, 1.0 - 1e-4), gate_target.clamp(0.0, 1.0))
+
+        vel_loss = torch.tensor(0.0, device=pred_df0.device, dtype=torch.float32)
+        var_loss = torch.tensor(0.0, device=pred_df0.device, dtype=torch.float32)
+        if pred_df0.shape[-1] >= 3:
+            w_pair = w[:, :, 1:] * w[:, :, :-1]
+            vel_loss = (
+                F.l1_loss(pred_df0[:, :, 1:] - pred_df0[:, :, :-1], tgt_df0[:, :, 1:] - tgt_df0[:, :, :-1], reduction="none")
+                * w_pair
+            ).sum() / w_pair.sum().clamp(min=1.0)
+
+            p_rms = torch.sqrt((pred_df0.pow(2) * w).sum(dim=-1) / w.sum(dim=-1).clamp(min=1.0) + 1e-8)
+            t_rms = torch.sqrt((tgt_df0.pow(2) * w).sum(dim=-1) / w.sum(dim=-1).clamp(min=1.0) + 1e-8)
+            var_loss = F.l1_loss(p_rms, t_rms)
+
+        return 10.0 * f0_l1 + 15.0 * vel_loss + 5.0 * var_loss + 0.5 * e_l1 + 0.5 * gate_loss
 
     @staticmethod
     def _compute_content_loss(
@@ -2239,11 +2493,12 @@ class StereoMultiResolutionSVCLoss(nn.Module):
         pred_lr_mel = out["pred_lr_mel"]
         target_lr_mel = out["target_lr_mel"]
         target_ms_mel = out["target_ms_mel"]
+        tgt_wav = out.get("target_wav", target_wav)
 
         with torch.amp.autocast(device_type=pred_wav.device.type, enabled=False):
             B, C, L = pred_wav.shape
             pred_f32 = pred_wav.float()
-            tgt_f32 = target_wav.float()
+            tgt_f32 = tgt_wav.float()
 
             sc_loss = torch.tensor(0.0, device=pred_wav.device, dtype=torch.float32)
             mag_loss = torch.tensor(0.0, device=pred_wav.device, dtype=torch.float32)
@@ -2301,6 +2556,7 @@ class StereoMultiResolutionSVCLoss(nn.Module):
                 out["z_cont1"], out["z_cont2"], out["content_mask"]
             )
             pitch_loss = self._compute_roformer_pitch_loss(out)
+            style_loss = self._compute_style_loss(out)
 
             stft_total = 1.0 * mag_loss + 0.6 * sc_loss + 0.8 * flux_loss + 1.0 * env_loss
             total = (
@@ -2308,6 +2564,7 @@ class StereoMultiResolutionSVCLoss(nn.Module):
                 + 1.5 * mel_loss
                 + 0.6 * content_loss
                 + 1.0 * pitch_loss
+                + 0.5 * style_loss
             )
             stats = {
                 "total": float(total.item()),
@@ -2315,6 +2572,7 @@ class StereoMultiResolutionSVCLoss(nn.Module):
                 "mel": float(mel_loss.item()),
                 "f0": float(pitch_loss.item()),
                 "content": float(content_loss.item()),
+                "style": float(style_loss.item()),
             }
             return total, stats
 
@@ -2544,6 +2802,11 @@ def load_checkpoint_auto(
             f"initialized {len(missing)} new parameter tensor(s)."
         )
 
+    if "target_f0_p10" not in saved_state and bool(model.has_f0_stats.item()):
+        model.target_f0_p10.copy_(model.target_f0_median * 0.75)
+    if "target_f0_p90" not in saved_state and bool(model.has_f0_stats.item()):
+        model.target_f0_p90.copy_(model.target_f0_median * 1.55)
+
     if ema is not None and "ema_state" in ckpt:
         try:
             ema.load_state_dict(ckpt["ema_state"])
@@ -2580,6 +2843,7 @@ def format_terminal_stats(
         f"Loss: {loss_stats['total']:.4f} (EMA {ema_loss:.4f}) | "
         f"STFT: {loss_stats['stft']:.4f} | Mel: {loss_stats['mel']:.4f} | "
         f"F0: {loss_stats['f0']:.4f} | Cnt: {loss_stats['content']:.4f} | "
+        f"Sty: {loss_stats.get('style', 0.0):.4f} | "
         f"Prodigy d: {prodigy_d:.2e} | Grad: {grad_norm:.2f} | "
         f"{steps_per_sec:.2f} it/s | VRAM: {vram_gb:.2f} GB"
     )
@@ -2627,7 +2891,7 @@ def train_svc(args: argparse.Namespace) -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_pitch_params = sum(p.numel() for p in model.pitch_tracker.parameters() if p.requires_grad)
     print("=" * 100)
-    print(f" Native Stereo Polyphonic SVC (44.1 kHz) | RoPE-QKV + XSA + GEGLU + FSQ + Snake-NSF | Device: {device}")
+    print(f" Native Stereo Polyphonic SVC (44.1 kHz) | RoPE-QKV + XSA + GEGLU + FSQ + Learned Style-Cover + Snake-NSF | Device: {device}")
     print(f" Parameters: {n_params / 1e6:.2f}M (RoFormer Pitch Tracker: {n_pitch_params / 1e6:.2f}M) | Stereo Files: {dataset.num_files} ({dataset.total_seconds:.1f}s)")
     print(f" Optimizer: Prodigy (lr={args.lr}, d0=1e-6) | Checkpoints: {args.ckpt_dir} (every {args.save_every} steps, keep latest {args.keep_ckpts})")
     print("=" * 100)
@@ -2730,6 +2994,7 @@ def train_svc(args: argparse.Namespace) -> None:
                         "mel": f"{stats['mel']:.4f}",
                         "f0": f"{stats['f0']:.4f}",
                         "cnt": f"{stats['content']:.4f}",
+                        "sty": f"{stats['style']:.4f}",
                         "d": f"{prodigy_d:.1e}",
                         "grad": f"{grad_norm:.2f}",
                     }
@@ -2861,7 +3126,7 @@ def infer_svc(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Native Stereo Singing Voice Conversion (44.1 kHz, RoPE on Q/K/V + Exclusive Self Attention + GEGLU + Learned Sparse Polyphonic RoFormer Pitch Tracker + Prodigy)"
+        description="Native Stereo Singing Voice Conversion (44.1 kHz, RoPE on Q/K/V + Exclusive Self Attention + GEGLU + Learned Sparse Polyphonic RoFormer Pitch Tracker + Learned Cover-Style Prosody/Accent + Prodigy)"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true", help="Train on a folder of WAV/FLAC files or a single file")
