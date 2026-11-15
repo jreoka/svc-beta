@@ -794,7 +794,10 @@ class StereoAcousticFeatureExtractor(nn.Module):
 
             raw_acf_peak = acf_at_lag.max(dim=-1).values.clamp(0.0, 1.0)
             raw_comb_peak = comb_salience.max(dim=-1).values.clamp(0.0, 1.0)
-            energy_floor = log_energy_mid.amax(dim=-1, keepdim=True) - 4.4
+            energy_floor = torch.maximum(
+                log_energy_mid.amax(dim=-1, keepdim=True) - 4.4,
+                torch.full((B, 1), -9.0, device=device, dtype=torch.float32),
+            )
             energy_gate = torch.sigmoid((log_energy_mid - energy_floor) * 2.5)
             ref_voicing = (
                 ((raw_acf_peak > 0.22) | (raw_comb_peak > 0.35))
@@ -2147,7 +2150,7 @@ class SingingVoiceConverter(nn.Module):
         shifted_ms_mel = self.extractor.shift_mel_by_f0_bins(ms_log_mel, shift_f0_bins)
         return shifted_lr_mel, shifted_ms_mel, shifted_acf, shifted_comb, shifted_pan
 
-    def forward_train(self, wav: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward_train(self, wav: torch.Tensor, shift_bins: Optional[int] = None) -> Dict[str, torch.Tensor]:
         B, C, L = wav.shape
 
         with torch.no_grad():
@@ -2164,7 +2167,7 @@ class SingingVoiceConverter(nn.Module):
             partner = torch.roll(wav, shifts=1, dims=0)
             mix_gain = torch.empty(B, 1, 1, device=wav.device).uniform_(0.45, 0.75)
             mixed_wav = (0.72 * wav + mix_gain * partner).clamp(-0.99, 0.99)
-            do_mix = torch.rand((), device=wav.device) < 0.25
+            do_mix = torch.rand((), device=wav.device) < 0.15
             train_wav = torch.where(do_mix, mixed_wav, wav)
         else:
             train_wav = wav
@@ -2205,14 +2208,15 @@ class SingingVoiceConverter(nn.Module):
         periodicity = pitch_out["periodicity"]
         voicing_logit = pitch_out["voicing_logit"]
 
-        shift_bins = random.choice([-60, -48, -36, -24, -12, 12, 24, 36, 48, 60])
+        if shift_bins is None:
+            shift_bins = random.choice([-60, -48, -36, -24, -12, 12, 24, 36, 48, 60])
         sh_lr, sh_ms, sh_acf, sh_comb, sh_pan = self._shift_pitch_features(
             target_lr_mel[:1], target_ms_mel[:1], acf_salience[:1], comb_salience[:1], pan_salience[:1], shift_bins
         )
         shifted_pitch_out = self.pitch_tracker(sh_lr, sh_ms, sh_acf, sh_comb, sh_pan, stereo_energy[:1])
 
         aug_mel_1 = self.extractor.augment_mel_for_content(
-            target_lr_mel, strength_range=(0.55, 1.0), clean_prob=0.0
+            target_lr_mel, strength_range=(0.55, 1.0), clean_prob=0.15
         )
         aug_mel_2 = self.extractor.augment_mel_for_content(
             target_lr_mel, strength_range=(0.65, 1.0), clean_prob=0.0
@@ -2344,6 +2348,7 @@ class SingingVoiceConverter(nn.Module):
         init_phase: Optional[torch.Tensor] = None,
         phase_anchor_idx: int = 0,
         return_phase: bool = False,
+        style_strength: float = 0.5,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         B, C, L_orig = source_wav.shape
         hop = self.cfg.hop_length
@@ -2401,10 +2406,11 @@ class SingingVoiceConverter(nn.Module):
             macro_energy,
             self.target_singer_emb,
         )
-        g_f0 = style_gate.transpose(1, 2)
+        g_e = (style_gate * max(0.0, min(1.0, style_strength))).clamp(0.0, 1.0)
+        g_f0 = g_e.transpose(1, 2)
         blended_log2 = torch.log2(macro_f0_hz.clamp(min=1.0)) + (1.0 - g_f0) * src_delta_f0 + g_f0 * pred_delta_f0
         track_f0_hz = (2.0 ** blended_log2).clamp(self.cfg.f0_min * 0.5, self.cfg.f0_max * 1.5)
-        stereo_energy = macro_energy + (1.0 - style_gate) * src_delta_energy + style_gate * pred_delta_energy
+        stereo_energy = macro_energy + (1.0 - g_e) * src_delta_energy + g_e * pred_delta_energy
 
         cond = (
             self.content_proj(z_content)
@@ -3086,7 +3092,8 @@ def train_svc(args: argparse.Namespace) -> None:
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    out = model.forward_train(wav_batch)
+                    shift_bins = random.choice([-60, -48, -36, -24, -12, 12, 24, 36, 48, 60])
+                    out = model.forward_train(wav_batch, shift_bins=shift_bins)
                     loss, stats = criterion(
                         out,
                         wav_batch,
@@ -3202,7 +3209,7 @@ def infer_svc(args: argparse.Namespace) -> None:
         pad_rem = (cfg.hop_length - (total_len % cfg.hop_length)) % cfg.hop_length
         pad_mode = "reflect" if total_len > pad_rem else "constant"
         wav_in = F.pad(src_wav, (0, pad_rem), mode=pad_mode).unsqueeze(0)
-        out_wav = model.convert_chunk(wav_in).squeeze(0)[:, :total_len]
+        out_wav = model.convert_chunk(wav_in, style_strength=args.style_strength).squeeze(0)[:, :total_len]
     else:
         hop_chunk = chunk_samples - xfade_samples
         out_buf = torch.zeros(2, total_len + chunk_samples, device=device)
@@ -3230,6 +3237,7 @@ def infer_svc(args: argparse.Namespace) -> None:
                 init_phase=prev_init_phase,
                 phase_anchor_idx=ctx_left,
                 return_phase=True,
+                style_strength=args.style_strength,
             )
             conv_full = conv_full.squeeze(0)
 
@@ -3290,6 +3298,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--no_ema", action="store_true", help="Use raw weights instead of EMA weights during inference")
     parser.add_argument("--chunk_seconds", type=float, default=6.0, help="Inference chunk duration in seconds")
+    parser.add_argument("--style_strength", type=float, default=0.5, help="Target singer prosody/vibrato blend strength at inference (0.0-1.0, default: 0.5)")
 
     return parser.parse_args()
 
