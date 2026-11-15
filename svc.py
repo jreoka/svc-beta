@@ -2899,6 +2899,13 @@ def train_svc(args: argparse.Namespace) -> None:
         if loaded_path is not None:
             print(f"[Auto-Resume] Resumed from '{loaded_path}' at Epoch {start_epoch}, Step {global_step}")
 
+    if args.compile:
+        if hasattr(torch, "compile"):
+            print("[Compile] Compiling model.forward_train with torch.compile...")
+            model.forward_train = torch.compile(model.forward_train)
+        else:
+            print("[Warn] --compile requested, but torch.compile is not available in this PyTorch build.")
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_pitch_params = sum(p.numel() for p in model.pitch_tracker.parameters() if p.requires_grad)
     print("=" * 100)
@@ -3057,6 +3064,13 @@ def infer_svc(args: argparse.Namespace) -> None:
     model.eval()
     print(f"[Auto-Infer] Loaded checkpoint '{ckpt_path}' (step {step}, epoch {epoch})")
 
+    if args.compile:
+        if hasattr(torch, "compile"):
+            print("[Compile] Compiling model.convert_chunk with torch.compile...")
+            model.convert_chunk = torch.compile(model.convert_chunk)
+        else:
+            print("[Warn] --compile requested, but torch.compile is not available in this PyTorch build.")
+
     src_wav = load_audio_stereo(args.input, target_sr=cfg.sample_rate).to(device)
     total_len = src_wav.shape[-1]
 
@@ -3169,6 +3183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fresh", action="store_true", help="Ignore existing checkpoints and start fresh")
     parser.add_argument("--no_amp", action="store_true", help="Disable automatic mixed precision")
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution")
+    parser.add_argument("--compile", action="store_true", help="Compile the model with torch.compile")
 
     parser.add_argument("--pitch_shift", type=float, default=0.0, help="Additional pitch shift in semitones during inference")
     parser.add_argument("--no_auto_f0", action="store_true", help="Disable automatic median F0 register matching")
