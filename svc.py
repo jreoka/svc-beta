@@ -586,45 +586,87 @@ class StereoAcousticFeatureExtractor(nn.Module):
         sieve_kernel = create_harmonic_sieve_matrix(cfg.n_f0_bins, self.bin_step_log2)
         self.register_buffer("sieve_kernel", sieve_kernel, persistent=False)
 
-    def stft(self, wav: torch.Tensor) -> torch.Tensor:
+        # Real-valued DFT / IDFT bases for torch.compile (Inductor does not codegen complex ops)
+        W = cfg.win_length
+        k_acf = torch.arange(W + 1, dtype=torch.float32).unsqueeze(0)
+        n_acf = torch.arange(W, dtype=torch.float32).unsqueeze(1)
+        angles_acf = 2.0 * math.pi * n_acf * k_acf / float(fft_len)
+        self.register_buffer("rfft_cos", torch.cos(angles_acf), persistent=False)
+        self.register_buffer("rfft_sin", -torch.sin(angles_acf), persistent=False)
+
+        irfft_scale = torch.full((W + 1, 1), 2.0 / float(fft_len), dtype=torch.float32)
+        irfft_scale[0] = 1.0 / float(fft_len)
+        irfft_scale[-1] = 1.0 / float(fft_len)
+        angles_irfft = 2.0 * math.pi * k_acf.transpose(0, 1) * n_acf.transpose(0, 1) / float(fft_len)
+        self.register_buffer("irfft_cos", irfft_scale * torch.cos(angles_irfft), persistent=False)
+
+        n_fft = cfg.n_fft
+        n_freqs = n_fft // 2 + 1
+        if cfg.win_length < n_fft:
+            pad_left = (n_fft - cfg.win_length) // 2
+            pad_right = n_fft - cfg.win_length - pad_left
+            stft_win = F.pad(window, (pad_left, pad_right))
+        else:
+            stft_win = window[:n_fft]
+
+        k_stft = torch.arange(n_freqs, dtype=torch.float32).unsqueeze(1)
+        n_stft = torch.arange(n_fft, dtype=torch.float32).unsqueeze(0)
+        angles_stft = 2.0 * math.pi * k_stft * n_stft / float(n_fft)
+
+        stft_cos = (stft_win.unsqueeze(0) * torch.cos(angles_stft)).unsqueeze(1)
+        stft_sin = (-stft_win.unsqueeze(0) * torch.sin(angles_stft)).unsqueeze(1)
+        self.register_buffer("stft_kernel", torch.cat([stft_cos, stft_sin], dim=0), persistent=False)
+
+        istft_scale = torch.full((n_freqs, 1), 2.0 / float(n_fft), dtype=torch.float32)
+        istft_scale[0] = 1.0 / float(n_fft)
+        if n_fft % 2 == 0:
+            istft_scale[-1] = 1.0 / float(n_fft)
+        istft_cos = (istft_scale * stft_win.unsqueeze(0) * torch.cos(angles_stft)).unsqueeze(1)
+        istft_sin = (-istft_scale * stft_win.unsqueeze(0) * torch.sin(angles_stft)).unsqueeze(1)
+        self.register_buffer("istft_kernel", torch.cat([istft_cos, istft_sin], dim=0), persistent=False)
+        self.register_buffer("stft_win_sq", (stft_win ** 2).view(1, 1, n_fft), persistent=False)
+
+    def stft_ri(self, wav: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.amp.autocast(device_type=wav.device.type, enabled=False):
             wav_f32 = wav.float()
-            if wav_f32.ndim == 3:
-                B, C, L = wav_f32.shape
-                flat = wav_f32.reshape(B * C, L)
-                spec = self.stft(flat)
-                return spec.view(B, C, spec.shape[-2], spec.shape[-1])
-
-            pad_mode = "reflect" if wav_f32.shape[-1] > (self.cfg.n_fft // 2) else "constant"
-            return torch.stft(
-                wav_f32,
-                n_fft=self.cfg.n_fft,
-                hop_length=self.cfg.hop_length,
-                win_length=self.cfg.win_length,
-                window=self.window.to(wav.device, dtype=torch.float32),
-                center=True,
-                pad_mode=pad_mode,
-                return_complex=True,
+            lead_shape = wav_f32.shape[:-1]
+            L = wav_f32.shape[-1]
+            flat = wav_f32.reshape(-1, L)
+            pad = self.cfg.n_fft // 2
+            pad_mode = "reflect" if L > pad else "constant"
+            wav_pad = F.pad(flat, (pad, pad), mode=pad_mode).unsqueeze(1)
+            out = F.conv1d(
+                wav_pad,
+                self.stft_kernel.to(device=wav.device, dtype=torch.float32),
+                stride=self.cfg.hop_length,
             )
+            spec_r, spec_i = out.chunk(2, dim=1)
+            out_shape = (*lead_shape, spec_r.shape[-2], spec_r.shape[-1])
+            return spec_r.view(out_shape), spec_i.view(out_shape)
 
-    def istft(self, spec: torch.Tensor, length: int) -> torch.Tensor:
-        with torch.amp.autocast(device_type=spec.device.type, enabled=False):
-            spec_c64 = spec.to(torch.complex64)
-            if spec_c64.ndim == 4:
-                B, C, F_bins, T = spec_c64.shape
-                flat = spec_c64.reshape(B * C, F_bins, T)
-                wav = self.istft(flat, length=length)
-                return wav.view(B, C, length)
-
-            return torch.istft(
-                spec_c64,
-                n_fft=self.cfg.n_fft,
-                hop_length=self.cfg.hop_length,
-                win_length=self.cfg.win_length,
-                window=self.window.to(spec.device, dtype=torch.float32),
-                center=True,
-                length=length,
+    def istft_ri(self, spec_r: torch.Tensor, spec_i: torch.Tensor, length: int) -> torch.Tensor:
+        with torch.amp.autocast(device_type=spec_r.device.type, enabled=False):
+            r_f32 = spec_r.float()
+            i_f32 = spec_i.float()
+            lead_shape = r_f32.shape[:-2]
+            F_bins, T = r_f32.shape[-2], r_f32.shape[-1]
+            spec_cat = torch.cat(
+                [r_f32.reshape(-1, F_bins, T), i_f32.reshape(-1, F_bins, T)], dim=1
             )
+            y_pad = F.conv_transpose1d(
+                spec_cat,
+                self.istft_kernel.to(device=spec_r.device, dtype=torch.float32),
+                stride=self.cfg.hop_length,
+            )
+            ones = torch.ones((1, 1, T), device=spec_r.device, dtype=torch.float32)
+            win_env = F.conv_transpose1d(
+                ones,
+                self.stft_win_sq.to(device=spec_r.device, dtype=torch.float32),
+                stride=self.cfg.hop_length,
+            )
+            pad = self.cfg.n_fft // 2
+            y = (y_pad / win_env.clamp(min=1e-11))[:, 0, pad : pad + length]
+            return y.view(*lead_shape, length)
 
     @staticmethod
     def _interp_1d_bins(profile: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -683,13 +725,17 @@ class StereoAcousticFeatureExtractor(nn.Module):
             log_energy_mid = 0.5 * (stereo_energy[..., 0] + stereo_energy[..., 1])
 
             fft_len = 2 * W
-            spec_2ch = torch.fft.rfft(win_frames, n=fft_len, dim=-1)
-            power_2ch = spec_2ch.real ** 2 + spec_2ch.imag ** 2
+            rfft_cos = self.rfft_cos.to(device=device, dtype=torch.float32)
+            rfft_sin = self.rfft_sin.to(device=device, dtype=torch.float32)
+            spec_real = torch.matmul(win_frames, rfft_cos)
+            spec_imag = torch.matmul(win_frames, rfft_sin)
+            power_2ch = spec_real * spec_real + spec_imag * spec_imag
             power_sum = power_2ch.sum(dim=1)
             power_max = power_2ch.max(dim=1).values
             power_joint = 0.60 * power_sum + 0.40 * power_max
 
-            acf = torch.fft.irfft(power_joint, n=fft_len, dim=-1)[..., :W]
+            irfft_cos = self.irfft_cos.to(device=device, dtype=torch.float32)
+            acf = torch.matmul(power_joint, irfft_cos)
             r0 = acf[..., 0:1].clamp(min=1e-7)
             win_acf = self.win_acf.to(device, dtype=torch.float32).view(1, 1, W)
             norm_acf = (acf / (r0 * win_acf)).clamp(-1.0, 1.0)
@@ -822,20 +868,28 @@ class StereoAcousticFeatureExtractor(nn.Module):
 
     def compute_stereo_log_mel(self, wav: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with torch.amp.autocast(device_type=wav.device.type, enabled=False):
-            spec = self.stft(wav.float())
+            spec_r, spec_i = self.stft_ri(wav.float())
             fb = self.mel_fb.to(wav.device, dtype=torch.float32)
 
-            mag_lr = spec.abs()
+            mag_lr = torch.sqrt(spec_r * spec_r + spec_i * spec_i + 1e-12)
             mel_lr = torch.matmul(fb, mag_lr)
             lr_log_mel = torch.log(mel_lr.clamp(min=1e-5)).transpose(-1, -2).contiguous()
 
-            spec_mid = 0.5 * (spec[:, 0] + spec[:, 1])
-            spec_side = 0.5 * (spec[:, 0] - spec[:, 1])
-            mag_ms = torch.stack([spec_mid.abs(), spec_side.abs()], dim=1)
+            mid_r = 0.5 * (spec_r[:, 0] + spec_r[:, 1])
+            mid_i = 0.5 * (spec_i[:, 0] + spec_i[:, 1])
+            side_r = 0.5 * (spec_r[:, 0] - spec_r[:, 1])
+            side_i = 0.5 * (spec_i[:, 0] - spec_i[:, 1])
+            mag_ms = torch.stack(
+                [
+                    torch.sqrt(mid_r * mid_r + mid_i * mid_i + 1e-12),
+                    torch.sqrt(side_r * side_r + side_i * side_i + 1e-12),
+                ],
+                dim=1,
+            )
             mel_ms = torch.matmul(fb, mag_ms)
             ms_log_mel = torch.log(mel_ms.clamp(min=1e-5)).transpose(-1, -2).contiguous()
 
-            return lr_log_mel, ms_log_mel, spec
+            return lr_log_mel, ms_log_mel, torch.stack([spec_r, spec_i], dim=-1)
 
     @torch.no_grad()
     def augment_mel_for_content(
@@ -1833,8 +1887,8 @@ class StereoHarmonicPlusNoiseSynthesizer(nn.Module):
             unvoiced_boost = 1.0 - 0.35 * lead_voiced_up
             stereo_white_noise = (mid_noise + side_noise) * unvoiced_boost
 
-            noise_spec = extractor.stft(stereo_white_noise)
-            T_stft = noise_spec.shape[-1]
+            noise_r, noise_i = extractor.stft_ri(stereo_white_noise)
+            T_stft = noise_r.shape[-1]
             if noise_env.shape[-1] != T_stft:
                 noise_env = F.interpolate(
                     noise_env.reshape(B * 2, self.n_freqs, -1),
@@ -1842,15 +1896,19 @@ class StereoHarmonicPlusNoiseSynthesizer(nn.Module):
                     mode="linear",
                     align_corners=align_flag,
                 ).view(B, 2, self.n_freqs, T_stft)
-            filtered_noise_spec = noise_spec * noise_env
+            filt_noise_r = noise_r * noise_env
+            filt_noise_i = noise_i * noise_env
 
-            harm_spec = extractor.stft(harmonic_sig)
-            if harm_spec.shape[-1] != T_stft:
-                T_stft = min(harm_spec.shape[-1], filtered_noise_spec.shape[-1])
-                harm_spec = harm_spec[..., :T_stft]
-                filtered_noise_spec = filtered_noise_spec[..., :T_stft]
+            harm_r, harm_i = extractor.stft_ri(harmonic_sig)
+            if harm_r.shape[-1] != T_stft:
+                T_stft = min(harm_r.shape[-1], filt_noise_r.shape[-1])
+                harm_r = harm_r[..., :T_stft]
+                harm_i = harm_i[..., :T_stft]
+                filt_noise_r = filt_noise_r[..., :T_stft]
+                filt_noise_i = filt_noise_i[..., :T_stft]
 
-            base_spec = harm_spec + filtered_noise_spec
+            base_r = harm_r + filt_noise_r
+            base_i = harm_i + filt_noise_i
 
             formant_raw = (
                 self.formant_filter_head(h_f32)
@@ -1878,11 +1936,14 @@ class StereoHarmonicPlusNoiseSynthesizer(nn.Module):
                     align_corners=align_flag,
                 ).view(B, 2, self.n_freqs, T_stft)
 
-            formant_mag = torch.exp(log_gain_fft)
-            complex_filt = torch.polar(formant_mag.float(), phase_disp_fft.float())
+            formant_mag = torch.exp(log_gain_fft).float()
+            phase_f = phase_disp_fft.float()
+            filt_r = formant_mag * torch.cos(phase_f)
+            filt_i = formant_mag * torch.sin(phase_f)
 
-            out_spec = base_spec.to(torch.complex64) * complex_filt
-            y_dsp = extractor.istft(out_spec, length=target_length)
+            out_r = base_r * filt_r - base_i * filt_i
+            out_i = base_r * filt_i + base_i * filt_r
+            y_dsp = extractor.istft_ri(out_r, out_i, length=target_length)
 
             pred_wav = self.refiner(h_f32, y_dsp, harmonic_sig, stereo_white_noise)
             if return_phase:
