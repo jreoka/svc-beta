@@ -96,8 +96,8 @@ class SVCConfig:
     max_polyphony: int = 4
 
     dim: int = 384
-    content_dim: int = 32
-    fsq_levels: int = 15
+    content_dim: int = 12
+    fsq_levels: int = 5
     pitch_encoder_depth: int = 4
     encoder_depth: int = 4
     decoder_depth: int = 8
@@ -871,7 +871,7 @@ class StereoAcousticFeatureExtractor(nn.Module):
             side_scale = 1.0 + strength.view(B, 1, 1, 1) * torch.empty(B, 1, 1, 1, device=device).uniform_(-0.90, 0.35)
             mel_mix = torch.cat([mid + flip * side_scale * side, mid - flip * side_scale * side], dim=1)
 
-            vtln_alpha = 1.0 + strength * torch.empty(B, 1, 1, device=device).uniform_(-0.22, 0.25)
+            vtln_alpha = 1.0 + strength * torch.empty(B, 1, 1, device=device).uniform_(-0.28, 0.32)
             pivot = torch.empty(B, 1, 1, device=device).uniform_(0.25, 0.65)
             base_01 = torch.linspace(0.0, 1.0, M, device=device).view(1, 1, M)
             high_slope = (1.0 - pivot * vtln_alpha) / (1.0 - pivot).clamp(min=1e-4)
@@ -880,7 +880,7 @@ class StereoAcousticFeatureExtractor(nn.Module):
                 base_01 * vtln_alpha,
                 pivot * vtln_alpha + (base_01 - pivot) * high_slope,
             )
-            mel_shift = strength * torch.empty(B, 1, 1, device=device).uniform_(-0.14, 0.14)
+            mel_shift = strength * torch.empty(B, 1, 1, device=device).uniform_(-0.22, 0.22)
             warped_grid = (warped_01 * 2.0 - 1.0 + mel_shift).clamp(-1.0, 1.0)
             time_grid = torch.linspace(-1.0, 1.0, T, device=device).view(1, T, 1).expand(B, T, M)
             sample_grid = torch.stack([warped_grid.expand(B, T, M), time_grid], dim=-1)
@@ -891,7 +891,7 @@ class StereoAcousticFeatureExtractor(nn.Module):
                 flat_x, flat_grid, mode="bilinear", padding_mode="border", align_corners=True
             ).view(B, C, T, M)
 
-            sigma = strength.view(B, 1) * torch.empty(B, 1, device=device).uniform_(0.0, 1.8)
+            sigma = strength.view(B, 1) * torch.empty(B, 1, device=device).uniform_(0.4, 2.4)
             offsets = torch.arange(-3, 4, device=device, dtype=torch.float32).view(1, 7)
             k_gauss = torch.where(
                 sigma > 1e-3,
@@ -904,12 +904,20 @@ class StereoAcousticFeatureExtractor(nn.Module):
 
             non_silent = (mel_f32.amax(dim=-1, keepdim=True) > -10.5).float()
             tilt_axis = torch.linspace(-1.0, 1.0, M, device=device).view(1, 1, 1, M)
-            tilt = strength.view(B, 1, 1, 1) * torch.empty(B, 1, 1, 1, device=device).uniform_(-0.75, 0.75) * tilt_axis
-            knots = torch.randn(B, 1, 8, device=device) * (0.45 * strength.view(B, 1, 1))
+            tilt = strength.view(B, 1, 1, 1) * torch.empty(B, 1, 1, 1, device=device).uniform_(-1.20, 1.20) * tilt_axis
+            knots = torch.randn(B, 1, 8, device=device) * (0.65 * strength.view(B, 1, 1))
             eq_curve = F.interpolate(knots, size=M, mode="linear", align_corners=True).view(B, 1, 1, M)
             pan_jitter = torch.randn(B, C, 1, 1, device=device) * (0.15 * strength.view(B, 1, 1, 1))
             noise = torch.randn_like(blurred) * (0.06 * strength.view(B, 1, 1, 1))
-            return blurred + (tilt + eq_curve + pan_jitter + noise) * non_silent
+            out_mel = blurred + (tilt + eq_curve + pan_jitter + noise) * non_silent
+            m_idx = torch.arange(M, device=device).view(1, 1, 1, M)
+            for _ in range(2):
+                f_start = torch.randint(0, max(1, M - 8), (B, 1, 1, 1), device=device)
+                f_width = torch.randint(3, 9, (B, 1, 1, 1), device=device)
+                f_mask = ((m_idx >= f_start) & (m_idx < (f_start + f_width))).float() * (strength.view(B, 1, 1, 1) > 0.25).float()
+                local_fill = out_mel.mean(dim=-1, keepdim=True)
+                out_mel = out_mel * (1.0 - f_mask) + local_fill * f_mask
+            return out_mel
 
 
 class QKVRopeEmbedding(nn.Module):
@@ -1311,9 +1319,8 @@ class StereoRoFormerPitchTracker(nn.Module):
 class StereoContentEncoder(nn.Module):
     def __init__(self, cfg: SVCConfig):
         super().__init__()
-        self.fsq_levels = int(getattr(cfg, "fsq_levels", 15))
-        self.raw_accent_sigma = nn.Parameter(torch.tensor(-0.35))
-        self.in_proj = nn.Linear(cfg.n_mels * 3, cfg.dim)
+        self.fsq_levels = int(getattr(cfg, "fsq_levels", 5))
+        self.in_proj = nn.Linear(cfg.n_mels, cfg.dim)
         self.conv_stem = nn.Sequential(
             nn.Conv1d(cfg.dim, cfg.dim, kernel_size=5, padding=2, groups=cfg.dim),
             nn.GELU(),
@@ -1332,21 +1339,25 @@ class StereoContentEncoder(nn.Module):
         self.out_norm = RMSNorm(cfg.dim)
         self.bottleneck = nn.Linear(cfg.dim, cfg.content_dim, bias=False)
 
-    def _learned_accent_blur(self, lr_log_mel: torch.Tensor) -> torch.Tensor:
-        """Differentiable frequency-axis Gaussian blur with learned bandwidth to neutralize source accent."""
-        sigma = 1.25 * torch.sigmoid(self.raw_accent_sigma.float()) + 0.05
-        mel_f32 = lr_log_mel.float()
-        B, C, T, M = mel_f32.shape
+    @staticmethod
+    def _accent_blur(mid_log_mel: torch.Tensor) -> torch.Tensor:
+        """Fixed frequency-axis Gaussian blur to smooth out F0 harmonics and narrow source resonances."""
+        mel_f32 = mid_log_mel.float()
+        B, T, M = mel_f32.shape
         offsets = torch.arange(-3, 4, device=mel_f32.device, dtype=torch.float32)
-        k_gauss = torch.exp(-0.5 * (offsets / sigma) ** 2)
-        k_gauss = (k_gauss / k_gauss.sum().clamp(min=1e-6)).view(1, 1, 1, 1, 7)
-        w_pad = F.pad(mel_f32.reshape(B * C, T, M), (3, 3), mode="replicate").view(B, C, T, M + 6)
+        k_gauss = torch.exp(-0.5 * (offsets / 1.0) ** 2)
+        k_gauss = (k_gauss / k_gauss.sum().clamp(min=1e-6)).view(1, 1, 1, 7)
+        w_pad = F.pad(mel_f32, (3, 3), mode="replicate").view(B, T, M + 6)
         return (w_pad.unfold(-1, 7, 1) * k_gauss).sum(dim=-1)
 
     @staticmethod
     def _frame_norm(mel: torch.Tensor) -> torch.Tensor:
-        """Gain- and chunk-length-invariant per-frame spectral normalization."""
+        """Gain- and spectral-tilt-invariant per-frame normalization."""
         m = mel.float()
+        M = m.shape[-1]
+        x_axis = torch.linspace(-1.0, 1.0, M, device=m.device, dtype=torch.float32)
+        slope = (m * x_axis).mean(dim=-1, keepdim=True) / (x_axis ** 2).mean()
+        m = m - slope * x_axis
         mu = m.mean(dim=-1, keepdim=True)
         sd = m.std(dim=-1, unbiased=False, keepdim=True) + 0.5
         return (m - mu) / sd
@@ -1354,11 +1365,9 @@ class StereoContentEncoder(nn.Module):
     def forward(
         self, lr_log_mel: torch.Tensor, return_continuous: bool = False
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        mel_blurred = self._learned_accent_blur(lr_log_mel)
-        mel_l = self._frame_norm(mel_blurred[:, 0])
-        mel_r = self._frame_norm(mel_blurred[:, 1])
-        mel_mid = self._frame_norm(0.5 * (mel_blurred[:, 0] + mel_blurred[:, 1]))
-        x_cat = torch.cat([mel_l, mel_r, mel_mid], dim=-1).to(self.in_proj.weight.dtype)
+        mel_mid = 0.5 * (lr_log_mel[:, 0] + lr_log_mel[:, 1])
+        mel_blurred = self._accent_blur(mel_mid)
+        x_cat = self._frame_norm(mel_blurred).to(self.in_proj.weight.dtype)
 
         x = self.in_proj(x_cat)
         x = x + self.conv_stem(x.transpose(1, 2)).transpose(1, 2)
@@ -2078,10 +2087,10 @@ class SingingVoiceConverter(nn.Module):
         shifted_pitch_out = self.pitch_tracker(sh_lr, sh_ms, sh_acf, sh_comb, sh_pan, stereo_energy[:1])
 
         aug_mel_1 = self.extractor.augment_mel_for_content(
-            target_lr_mel, strength_range=(0.0, 0.90), clean_prob=0.12
+            target_lr_mel, strength_range=(0.55, 1.0), clean_prob=0.0
         )
         aug_mel_2 = self.extractor.augment_mel_for_content(
-            target_lr_mel, strength_range=(0.45, 1.0), clean_prob=0.0
+            target_lr_mel, strength_range=(0.65, 1.0), clean_prob=0.0
         )
         z_aug1, z_cont1 = self.content_encoder(aug_mel_1, return_continuous=True)
         _, z_cont2 = self.content_encoder(aug_mel_2, return_continuous=True)
@@ -2464,7 +2473,9 @@ class StereoMultiResolutionSVCLoss(nn.Module):
 
         inv12 = 1.0 - (z1_u * z2_u.detach()).sum(dim=-1)
         inv21 = 1.0 - (z2_u * z1_u.detach()).sum(dim=-1)
-        inv_frame = 0.5 * (inv12 + inv21)
+        l1_12 = (z1 - z2.detach()).abs().mean(dim=-1)
+        l1_21 = (z2 - z1.detach()).abs().mean(dim=-1)
+        inv_frame = 0.5 * (inv12 + inv21) + 0.5 * (l1_12 + l1_21)
         mask_sum = content_mask.sum().clamp(min=1.0)
         inv_loss = (inv_frame * content_mask).sum() / mask_sum
 
@@ -2562,7 +2573,7 @@ class StereoMultiResolutionSVCLoss(nn.Module):
             total = (
                 stft_total
                 + 1.5 * mel_loss
-                + 0.6 * content_loss
+                + 2.0 * content_loss
                 + 1.0 * pitch_loss
                 + 0.5 * style_loss
             )
