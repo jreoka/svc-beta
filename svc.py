@@ -811,7 +811,8 @@ class StereoAcousticFeatureExtractor(nn.Module):
             ref_multi_activity = torch.zeros(B, T, N_bins, device=device, dtype=torch.float32)
             ref_pitch_unnorm = torch.zeros(B, T, N_bins, device=device, dtype=torch.float32)
 
-            for p_iter in range(N_bins):
+            max_passes = min(8, N_bins)
+            for p_iter in range(max_passes):
                 peak_val, peak_bin = residual_sal.max(dim=-1)
                 local_mask = (bin_indices - peak_bin.unsqueeze(-1)).abs() <= 5
                 masked_logits = torch.where(
@@ -842,8 +843,6 @@ class StereoAcousticFeatureExtractor(nn.Module):
                         sec_min = -F.max_pool1d(-F.pad(sec_1d, (1, 1), mode="replicate"), kernel_size=3, stride=1)
                         sec_clean = F.max_pool1d(F.pad(sec_min, (1, 1), mode="replicate"), kernel_size=3, stride=1)
                         is_true_secondary = sec_clean.squeeze(1).unsqueeze(-1)
-                    if not bool((is_true_secondary > 0.5).any().item()):
-                        break
                     active_gate = is_true_secondary * rel_val
 
                 gauss_peak = torch.exp(-0.5 * ((log2_grid.view(1, 1, N_bins) - peak_log2) / sigma_log2) ** 2)
@@ -1218,13 +1217,12 @@ class StereoRoFormerPitchTracker(nn.Module):
 
             sec_bins_list = []
             sec_acts_list = []
-            for _ in range(N_bins - 1):
+            max_sec_voices = min(7, N_bins - 1)
+            for _ in range(max_sec_voices):
                 val_k, bin_k = res_sec.max(dim=-1)
                 gate_k = torch.gather(multi_voice_gate, dim=-1, index=bin_k.unsqueeze(-1)).squeeze(-1)
                 rel_k = gate_k / max_sec_0
                 act_k = ((gate_k > 0.42) & (rel_k > 0.25) & (val_k > 0.18) & (periodicity > 0.35)).float()
-                if not bool((act_k > 0.5).any().item()):
-                    break
                 sec_bins_list.append(bin_k)
                 sec_acts_list.append(act_k)
                 res_sec = res_sec * (1.0 - 0.92 * sieve_mat[bin_k])
@@ -2162,11 +2160,14 @@ class SingingVoiceConverter(nn.Module):
             )
             self.update_f0_stats(clean_f0, wav=wav)
 
-        train_wav = wav
-        if self.training and B >= 2 and random.random() < 0.25:
+        if self.training and B >= 2:
             partner = torch.roll(wav, shifts=1, dims=0)
             mix_gain = torch.empty(B, 1, 1, device=wav.device).uniform_(0.45, 0.75)
-            train_wav = (0.72 * wav + mix_gain * partner).clamp(-0.99, 0.99)
+            mixed_wav = (0.72 * wav + mix_gain * partner).clamp(-0.99, 0.99)
+            do_mix = torch.rand((), device=wav.device) < 0.25
+            train_wav = torch.where(do_mix, mixed_wav, wav)
+        else:
+            train_wav = wav
 
         target_lr_mel, target_ms_mel, _ = self.extractor.compute_stereo_log_mel(train_wav)
         pitch_cues = self.extractor.extract_pitch_salience_and_stereo_energy(train_wav)
@@ -2297,9 +2298,6 @@ class SingingVoiceConverter(nn.Module):
         singer's register using a local-window octave match (preserving musical key and
         polyphonic chord intervals while adapting to male/female vocal switches).
         """
-        if not bool(self.has_f0_stats.item()):
-            return track_f0_hz.clamp(self.cfg.f0_min * 0.5, self.cfg.f0_max * 1.5)
-
         B, V, T = track_f0_hz.shape
         device = track_f0_hz.device
         log2_f0 = torch.log2(track_f0_hz.float().clamp(min=1.0))
@@ -2336,6 +2334,7 @@ class SingingVoiceConverter(nn.Module):
 
         oct_shift = torch.round(tgt_med_log2 - local_log2).clamp(-2.0, 2.0)
         auto_scale = 2.0 ** oct_shift
+        auto_scale = torch.where(self.has_f0_stats.to(device=device), auto_scale, torch.ones_like(auto_scale))
         return (track_f0_hz * auto_scale).clamp(self.cfg.f0_min * 0.5, self.cfg.f0_max * 1.5)
 
     @torch.no_grad()
