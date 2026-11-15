@@ -2029,31 +2029,51 @@ class SingingVoiceConverter(nn.Module):
 
     @torch.no_grad()
     def update_f0_stats(self, f0_hz: torch.Tensor, wav: Optional[torch.Tensor] = None) -> None:
-        voiced = f0_hz.detach()[f0_hz.detach() > 1.0]
-        if voiced.numel() > 16:
-            med = voiced.median()
-            p10 = torch.quantile(voiced.float(), 0.10)
-            p90 = torch.quantile(voiced.float(), 0.90)
-            std = voiced.std().clamp(min=5.0)
-            if not bool(self.has_f0_stats.item()):
-                self.target_f0_median.copy_(med)
-                self.target_f0_p10.copy_(p10)
-                self.target_f0_p90.copy_(p90)
-                self.target_f0_std.copy_(std)
-                self.has_f0_stats.fill_(True)
-            else:
-                self.target_f0_median.mul_(0.98).add_(med * 0.02)
-                self.target_f0_p10.mul_(0.98).add_(p10 * 0.02)
-                self.target_f0_p90.mul_(0.98).add_(p90 * 0.02)
-                self.target_f0_std.mul_(0.98).add_(std * 0.02)
+        f0 = f0_hz.detach().float().reshape(-1)
+        n = f0.shape[0]
+        if n > 16:
+            mask = f0 > 1.0
+            count = mask.sum()
+            valid = count > 16
+            safe_count = count.clamp(min=1)
+
+            sorted_f0, _ = torch.sort(torch.where(mask, f0, 1e9))
+
+            def _quantile(q: float) -> torch.Tensor:
+                pos = q * (safe_count - 1).float()
+                lo = pos.floor().long().clamp(0, n - 1)
+                hi = pos.ceil().long().clamp(0, n - 1)
+                frac = pos - lo.float()
+                v_lo = sorted_f0.gather(0, lo.view(1)).squeeze(0)
+                v_hi = sorted_f0.gather(0, hi.view(1)).squeeze(0)
+                return v_lo * (1.0 - frac) + v_hi * frac
+
+            med_idx = ((safe_count - 1) // 2).clamp(0, n - 1)
+            med = sorted_f0.gather(0, med_idx.view(1)).squeeze(0)
+            p10 = _quantile(0.10)
+            p90 = _quantile(0.90)
+
+            mask_f = mask.float()
+            mean = (f0 * mask_f).sum() / safe_count.float()
+            var = (((f0 - mean) ** 2) * mask_f).sum() / (count - 1).clamp(min=1).float()
+            std = torch.sqrt(var.clamp(min=0.0)).clamp(min=5.0)
+
+            first_f0 = ~self.has_f0_stats
+            for buf, val in (
+                (self.target_f0_median, med),
+                (self.target_f0_p10, p10),
+                (self.target_f0_p90, p90),
+                (self.target_f0_std, std),
+            ):
+                updated = torch.where(first_f0, val, buf * 0.98 + val * 0.02)
+                buf.copy_(torch.where(valid, updated, buf))
+            self.has_f0_stats.copy_(self.has_f0_stats | valid)
 
         if wav is not None:
             rms = torch.sqrt((wav.detach().float() ** 2).mean() + 1e-8).clamp(1e-3, 0.5)
-            if not bool(self.has_rms_stats.item()):
-                self.target_rms.copy_(rms)
-                self.has_rms_stats.fill_(True)
-            else:
-                self.target_rms.mul_(0.98).add_(rms * 0.02)
+            first_rms = ~self.has_rms_stats
+            self.target_rms.copy_(torch.where(first_rms, rms, self.target_rms * 0.98 + rms * 0.02))
+            self.has_rms_stats.fill_(True)
 
     @staticmethod
     def _roll_pad_last(x: torch.Tensor, shift: int, zero_pad: bool = False) -> torch.Tensor:
@@ -3017,21 +3037,18 @@ def train_svc(args: argparse.Namespace) -> None:
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
-    total_steps = args.max_steps if args.max_steps > 0 else (args.epochs * len(loader))
-    total_steps = max(total_steps, global_step)
-
     pbar = tqdm(
-        total=total_steps,
+        total=None,
         initial=global_step,
-        desc=f"Ep {start_epoch + 1}/{args.epochs}",
+        desc="step",
         dynamic_ncols=True,
         unit="step",
+        bar_format="{desc}: {n_fmt} [{elapsed}, {rate_fmt}{postfix}]",
     )
 
     try:
         for epoch in range(start_epoch + 1, args.epochs + 1):
             current_epoch = epoch
-            pbar.set_description(f"Ep {epoch}/{args.epochs}")
             model.train()
             for wav_batch in loader:
                 if interrupted:
@@ -3085,10 +3102,6 @@ def train_svc(args: argparse.Namespace) -> None:
                 if global_step % args.save_every == 0:
                     saved_path = do_save_checkpoint("periodic")
                     tqdm.write(f"  --> [Auto-Save] Saved checkpoint '{saved_path}' (step {global_step})")
-
-                if args.max_steps and global_step >= args.max_steps:
-                    interrupted = True
-                    break
 
             if interrupted:
                 break
@@ -3232,7 +3245,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment_frames", type=int, default=256, help="Training crop length in STFT frames (default: 256)")
 
     parser.add_argument("--epochs", type=int, default=100000, help="Total training epochs (default: 100000)")
-    parser.add_argument("--max_steps", type=int, default=0, help="Optional max training steps override (0 = disabled)")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size (default: 2)")
     parser.add_argument("--lr", type=float, default=1.0, help="Prodigy learning rate multiplier (default: 1.0)")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Prodigy decoupled weight decay (default: 0.01)")
