@@ -95,12 +95,12 @@ class SVCConfig:
     n_harmonics: int = 128
     max_polyphony: int = 4
 
-    dim: int = 384
+    dim: int = 256
     content_dim: int = 12
     fsq_levels: int = 5
     pitch_encoder_depth: int = 4
     encoder_depth: int = 4
-    decoder_depth: int = 8
+    decoder_depth: int = 6
     num_heads: int = 8
     ffn_mult: float = 8.0 / 3.0
     dropout: float = 0.05
@@ -3149,14 +3149,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="./converted_output.wav", help="Output converted stereo WAV/FLAC file for --infer")
 
     parser.add_argument("--sample_rate", type=int, default=44100, help="Audio sample rate (default: 44100)")
-    parser.add_argument("--dim", type=int, default=384, help="Transformer hidden dimension (default: 384)")
+    parser.add_argument("--dim", type=int, default=256, help="Transformer hidden dimension (default: 256)")
     parser.add_argument("--pitch_depth", type=int, default=4, help="RoFormer pitch tracker XSA-RoPE depth (default: 4)")
     parser.add_argument("--encoder_depth", type=int, default=4, help="Content encoder XSA-RoPE depth (default: 4)")
-    parser.add_argument("--decoder_depth", type=int, default=8, help="Decoder XSA-RoPE depth (default: 8)")
+    parser.add_argument("--decoder_depth", type=int, default=6, help="Decoder XSA-RoPE depth (default: 6)")
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads (default: 8)")
     parser.add_argument("--segment_frames", type=int, default=256, help="Training crop length in STFT frames (default: 256)")
 
-    parser.add_argument("--epochs", type=int, default=10000, help="Total training epochs (default: 10000)")
+    parser.add_argument("--epochs", type=int, default=100000, help="Total training epochs (default: 100000)")
     parser.add_argument("--max_steps", type=int, default=0, help="Optional max training steps override (0 = disabled)")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size (default: 4)")
     parser.add_argument("--lr", type=float, default=1.0, help="Prodigy learning rate multiplier (default: 1.0)")
